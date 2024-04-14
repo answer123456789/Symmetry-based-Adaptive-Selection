@@ -69,23 +69,7 @@ for (ii in 1:length(p_vec)) {
     f0_hat = function(x){
       return(0.5*(f0_hat0(x) + f0_hat0(c(x[2],x[1]))))
     }
-    
-    
-    f000_hat = function(x){sum(dnorm((x[1] - X1)/h000[1])*dnorm((x[2] - X2)/h000[2]))/(h000[1]*h000[2]*length(X1))}
-    
-    f000_hat(c(0,0))
-    f0_hat(c(0,0))
-    dnorm(0,sd=sd1) * dnorm(0,sd=sd1)
-    f000_hat(c(0.1,0.1))
-    f0_hat(c(0.1,0.1))
-    dnorm(0.1,sd=sd1) * dnorm(0.1,sd=sd1)
-    f000_hat(c(1,1))
-    f0_hat(c(1,1))
-    dnorm(1,sd=sd1) * dnorm(1,sd=sd1)
-    f000_hat(c(2,2))
-    f0_hat(c(2,2))
-    dnorm(2,sd=sd1) * dnorm(2,sd=sd1)
-    
+
     
     x_range <- seq(-3, 3, length.out = 80) 
     y_range <- seq(-3, 3, length.out = 80)
