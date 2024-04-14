@@ -1,0 +1,435 @@
+---
+title: "Knockoff Scenario (ix) [p = 50, 100, 150, 200]"
+output: html_document
+date: "2024-03-11"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r, results='hide'}
+path = dirname(rstudioapi::getActiveDocumentContext()$path)
+setwd(path)
+library(MASS) 
+library(ggplot2)
+library(glmnet)
+library(knockoff)
+library(ggthemes)
+library(patchwork)
+library(doSNOW)
+library(foreach)
+library(doParallel)
+cl <- makeCluster(10, outfile = 'outs.out')
+registerDoParallel(cl)
+registerDoSNOW(cl)
+clusterEvalQ(cl = cl, RhpcBLASctl::blas_set_num_threads(1))
+
+n = 400
+q_fdr = 0.1
+Rep_times = 200
+seeds = 12345 
+
+parameter_proportion = seq(50,200,50)
+names = c('50','100','150','200')
+parameter_magnitude = c(0.5) 
+names_mag = c('005')
+
+output_table_fdr = data.frame(matrix(0,4*length(parameter_proportion),length(parameter_magnitude)))
+output_table_power = data.frame(matrix(0,4*length(parameter_proportion),length(parameter_magnitude)))
+output_table_fdr_power = data.frame(matrix(ncol = 8, nrow = 0))
+
+for (k in 1:length(parameter_proportion)){
+  negative = 0.9
+  positive = 1 - negative
+  for (k_mag in 1:length(parameter_magnitude)){
+    magnitude = 0.45
+    corr1 = 0.3
+    DD_fdr_list  = list()
+    DD_power_list  = list()
+    S_fdr_list  = list()
+    S_power_list  = list()
+    SPlus_fdr_list  = list()
+    SPlus_power_list  = list()
+    Smin_fdr_list  = list()
+    Smin_power_list  = list()
+    d_X = parameter_proportion[k]
+    d_h1 = 30
+    d_h0 = d_X - d_h1
+    label_X1X2 = c(rep('Null', d_h0), rep('Non-null', d_h1))
+    posi_len = round(positive*d_h1)
+    nega_len = d_h1 - posi_len
+    Output_fdr_power <- foreach (time = 1:Rep_times, .packages =c('MASS', 'glmnet','knockoff')) %dopar%  {
+      source('Functions.R')
+      set.seed(time+seeds)
+      print(paste("Rep time:", time))
+      c1 = rep(magnitude,round(posi_len))
+      c2 = rep(-0.25,round(nega_len))
+      coef_X = matrix(c(rep(0,d_h0), c1, c2), d_X) # 0.4 0.5 -0.4 -0.35
+      
+      Sigma = diag(1,d_X,d_X)
+      for (i in 1:d_X) {
+        for (j in 1:d_X) {
+          Sigma[i,j] = corr1^abs(i-j)
+        }
+      }
+      X_matrix = mvrn(n, rep(0,d_X), Sigma)
+      X_matrix = X_matrix[,sample(d_X)]
+      Y = X_matrix %*% coef_X + rnorm(n,0,1)
+      
+      X_knockoffs = create.second_order(X_matrix, method = 'equi', shrink=T)
+      X_matrix = cbind(X_matrix, X_knockoffs)
+      
+      
+      cvfit <- cv.glmnet(X_matrix, Y, intercept = F, standardize = F)
+      lambda <- cvfit$lambda.min
+      beta1 <- as.vector(glmnet(X_matrix, Y, alpha = 1, lambda = lambda, intercept = F, standardize = F)$beta)
+      index_beta1 = which(beta1 == 0)
+      
+      
+      ## Get the debiased Lasso estimator
+      M1 = get_M(X_matrix)
+      beta1_d = as.numeric(beta1 + 1/n*M1%*%t(X_matrix)%*%(Y - X_matrix %*% beta1))
+      
+      ## Get the variance for the debiased Lasso estimator (up to a scaling factor)
+      sigma1 = sqrt(diag(M1%*%(t(X_matrix)%*%diag(diag((Y-X_matrix%*%beta1)%*%t(Y-X_matrix%*%beta1)))%*%X_matrix/(n/1))%*%t(M1)))
+      
+      tmp = beta1_d/sigma1
+      X1 = tmp[1:(d_X)] - tmp[(d_X+1):(d_X*2)]
+      X2 = tmp[1:(d_X)] + tmp[(d_X+1):(d_X*2)]
+      
+      index1 = intersect(which(X1>0),which(X2>0))
+      index2 = intersect(which(X1<0),which(X2>0))
+      index3 = intersect(which(X1<0),which(X2<0))
+      index4 = intersect(which(X1>0),which(X2<0))
+      
+      X1_4444 = c(X1[c(index2,index4)])
+      X2_4444 = c(X2[c(index2,index4)])
+      
+      h0 = c(bandwidth.nrd(X1_4444), bandwidth.nrd(X2_4444))
+      h1 = c(bandwidth.nrd(X1), bandwidth.nrd(X2))
+      
+      Kernel_h0 = function(x){0.3*sum(dnorm((x[1] - X1_4444)/h0[1])*dnorm((x[2] - X2_4444)/h0[2]))/(h0[1]*h0[2]*length(X1_4444))}
+      f0_hat0 = function(x){
+        return(0.25*(Kernel_h0(x) + Kernel_h0(c(-x[1],x[2])) + Kernel_h0(c(x[1],-x[2])) + Kernel_h0(-x)))
+      }
+      f0_hat = function(x){
+        return(0.5*(f0_hat0(x) + f0_hat0(c(x[2],x[1]))))
+      }
+      
+      Kernel_h1 = function(x){sum(dnorm((x[1] - X1)/h1[1])*dnorm((x[2] - X2)/h1[2]))/(h1[1]*h1[2]*length(X1))}
+      f_hat = function(x){
+        return(0.5*(Kernel_h1(x) + Kernel_h1(c(x[2],x[1]))))
+      }
+      
+      Lfdr_hat13 = function(x){min(1,(f0_hat(x)/f_hat(x)))}
+      lfdr_points_2 = rep(1,2*length(index2))
+      lfdr_points_4 = rep(1,2*length(index4))
+      lfdr_points13 = lfdr_points13 = rep(1,length(c(index1,index3)))
+      lfdr_points13 = apply(cbind(X1[c(index1,index3)],X2[c(index1,index3)]), 1, Lfdr_hat13)
+      lfdr_points_2= apply(cbind(c(X1[index2],-X1[index2]),c(-X2[index2], X2[index2])), 1, function(x){min(1,f0_hat(x)/f_hat(x))})
+      lfdr_points_4= apply(cbind(c(-X1[index4],X1[index4]),c(X2[index4], -X2[index4])), 1, function(x){min(1,f0_hat(x)/f_hat(x))})
+      
+      get_localfdr_threshold_half <- function(lfdr13, lfdr2, lfdr4,q_fdr){
+        t = sort(c(lfdr13,lfdr2,lfdr4))
+        t[t==1]=0.9999
+        Ta = sapply(t,function(x){(1+0.5*(length(lfdr4[lfdr4<=x]) + length(lfdr2[lfdr2<=x])))/max(1,length(lfdr13[lfdr13<=x]))})
+        sh = max(t[which(Ta<=q_fdr)]) 
+        return(sh)
+      }
+      
+      fdr_q = get_localfdr_threshold_half(lfdr_points13, lfdr_points_2, lfdr_points_4, q_fdr)
+      label_X1X2_13 = label_X1X2[c(index1,index3)]
+      number_d = length(which(lfdr_points13<=fdr_q))
+      number_td = length(intersect(which(lfdr_points13<=fdr_q), which(label_X1X2_13 != 'Null')))
+      
+      get_conventional_threshold <- function(S, q_fdr){
+        t = sort(abs(S))
+        Ta = sapply(t,function(x){(1+length(S[S<(-x)]))/max(1,length(S[S>x]))})
+        sh = min(t[which(Ta<=q_fdr)]) 
+        return(sh)
+      }
+      
+      S_tol = X1*X2
+      sh = get_conventional_threshold(S_tol,q_fdr)
+      S_fdr = length(intersect(which(S_tol > sh), which(label_X1X2 == 'Null'))) / max(length(which(S_tol >= sh)),1)
+      S_power = length(intersect(which(S_tol > sh), which(label_X1X2 != 'Null'))) / (d_X - d_h0)
+      
+      SPlus_tol = sign(X1*X2)*(abs(X1) + abs(X2))
+      sh = get_conventional_threshold(SPlus_tol,q_fdr)
+      SPlus_fdr = length(intersect(which(SPlus_tol > sh), which(label_X1X2 == 'Null'))) / max(length(which(SPlus_tol > sh)),1)
+      SPlus_power = length(intersect(which(SPlus_tol > sh), which(label_X1X2 != 'Null'))) / (d_X - d_h0)
+      Smin_tol = 2*sign(X1*X2)*apply(cbind(abs(X1), abs(X2)), 1, min)
+      sh = get_conventional_threshold(Smin_tol,q_fdr)
+      Smin_fdr = length(intersect(which(Smin_tol > sh), which(label_X1X2 == 'Null'))) / max(length(which(Smin_tol > sh)),1)
+      Smin_power = length(intersect(which(Smin_tol > sh), which(label_X1X2 != 'Null'))) / (d_X - d_h0)      
+      DD_fdr = (number_d - number_td)/ max(1,number_d)
+      DD_power = (number_td)/(d_X-d_h0)
+      
+      return(list(DD_fdr, DD_power, S_fdr, S_power, SPlus_fdr, SPlus_power, Smin_fdr, Smin_power))
+    }
+    
+    for (i in 1:Rep_times) {
+      DD_fdr_list[i]  = Output_fdr_power[[i]][[1]]
+      DD_power_list[i]  = Output_fdr_power[[i]][[2]]
+      S_fdr_list[i]  = Output_fdr_power[[i]][[3]]
+      S_power_list[i]  = Output_fdr_power[[i]][[4]]
+      SPlus_fdr_list[i]  = Output_fdr_power[[i]][[5]]
+      SPlus_power_list[i]  = Output_fdr_power[[i]][[6]]
+      Smin_fdr_list[i]  = Output_fdr_power[[i]][[7]]
+      Smin_power_list[i]  = Output_fdr_power[[i]][[8]]
+    }
+    
+    DD_fdr_list  = unlist(DD_fdr_list)
+    DD_power_list  = unlist(DD_power_list)
+    S_fdr_list  = unlist(S_fdr_list)
+    S_power_list  = unlist(S_power_list)
+    SPlus_fdr_list  = unlist(SPlus_fdr_list)
+    SPlus_power_list  = unlist(SPlus_power_list)
+    Smin_fdr_list  = unlist(Smin_fdr_list)
+    Smin_power_list  = unlist(Smin_power_list)
+    
+    output = data.frame(DD_fdr_list, S_fdr_list,SPlus_fdr_list, Smin_fdr_list, DD_power_list, S_power_list, SPlus_power_list, Smin_power_list)
+    output_table_fdr_power = rbind(output_table_fdr_power, output)
+    output_table_fdr[(4*(k-1)+1):(4*k),k_mag] = c(mean(DD_fdr_list),mean(S_fdr_list) ,mean(SPlus_fdr_list) ,mean(Smin_fdr_list))
+    output_table_power[(4*(k-1)+1):(4*k),k_mag] = c(mean(DD_power_list), mean(S_power_list), mean(SPlus_power_list), mean(Smin_power_list))
+  }
+}
+
+Parameter_proportion= rep(names_mag, each= Rep_times, time = length(parameter_proportion))
+output_table_fdr_power = cbind(output_table_fdr_power, Parameter_proportion)
+colnames(output_table_fdr_power) = c('Adaptive_fdr', 'Times_fdr', 'Plus_fdr', 'Min_fdr',
+                                     'Adaptive_power', 'Times_power', 'Plus_power', 'Min_power','Parameter_proportion')
+
+plot_data1 = data.frame(Power = output_table_power[,1], FDR = output_table_fdr[,1], `Threshold` = rep(c('Adaptive', 'KSCD', 'KLSM', 'KLCD'), length(parameter_proportion)), `delta` = rep(factor(parameter_proportion, level = as.character(parameter_proportion)), each=4))
+plot_data1[which(plot_data1$Threshold =='Adaptive'),3] = 'SAS'
+plot_data1$Threshold = factor(plot_data1$Threshold, levels = c('SAS', 'KSCD', 'KLSM', 'KLCD'),labels = c('SAS', 'KSCD', 'KLSM', 'KLCD'))
+Fig_power1 =  ggplot() +
+  geom_point(data = plot_data1, aes(x = delta, y= Power, color = Threshold, shape = Threshold), alpha =0.85) +
+  geom_line(data = plot_data1, aes(x = delta, y= Power, group = Threshold,color = Threshold, linetype = Threshold)) +
+  xlab(element_blank()) +
+  ylab('Power')+
+  theme_bw() +
+  theme(legend.title=element_blank(),
+        legend.key = element_rect(colour = "transparent", fill = "transparent"),
+        legend.background= element_rect(colour = "transparent", fill = "transparent"))
+
+Fig_FDR1 =  ggplot() +
+  geom_point(data = plot_data1, aes(x = delta, y= FDR, color = Threshold, shape = Threshold), alpha =0.85) +
+  geom_line(data = plot_data1, aes(x = delta, y= FDR, group = Threshold,color = Threshold, linetype = Threshold)) +
+  ylim(c(0,0.3)) +
+  xlab("p") +
+  ylab('FDR')+
+  theme_bw() +
+  geom_hline(yintercept = q_fdr, linetype='dashed', alpha=0.5) +
+  theme(legend.title=element_blank(),
+        legend.key = element_rect(colour = "transparent", fill = "transparent"),
+        legend.background= element_rect(colour = "transparent", fill = "transparent"))
+
+output_table_fdr = data.frame(matrix(0,4*length(parameter_proportion),length(parameter_magnitude)))
+output_table_power = data.frame(matrix(0,4*length(parameter_proportion),length(parameter_magnitude)))
+output_table_fdr_power = data.frame(matrix(ncol = 8, nrow = 0))
+
+for (k in 1:length(parameter_proportion)){
+  negative = 0.9
+  positive = 1 - negative
+  for (k_mag in 1:length(parameter_magnitude)){
+    magnitude = 0.45
+    corr1 = 0.3
+    DD_fdr_list  = list()
+    DD_power_list  = list()
+    S_fdr_list  = list()
+    S_power_list  = list()
+    SPlus_fdr_list  = list()
+    SPlus_power_list  = list()
+    Smin_fdr_list  = list()
+    Smin_power_list  = list()
+    d_X = parameter_proportion[k]
+    d_h1 = 30
+    d_h0 = d_X - d_h1
+    label_X1X2 = c(rep('Null', d_h0), rep('Non-null', d_h1))
+    posi_len = round(positive*d_h1)
+    nega_len = d_h1 - posi_len
+    Output_fdr_power <- foreach (time = 1:Rep_times, .packages =c('MASS', 'glmnet','knockoff')) %dopar%  {
+      source('Functions.R')
+      set.seed(time+seeds)
+      print(paste("Rep time:", time))
+      c1 = rep(magnitude,round(posi_len))
+      c2 = rep(-0.25,round(nega_len))
+      coef_X = matrix(c(rep(0,d_h0), c1, c2), d_X) 
+
+      Sigma = diag(1,d_X,d_X)
+      for (i in 1:d_X) {
+        for (j in 1:d_X) {
+          Sigma[i,j] = corr1^abs(i-j)
+        }
+      }
+      X_matrix = mvrn(n, rep(0,d_X), Sigma)
+      X_matrix = X_matrix[,sample(d_X)]
+      Y = X_matrix %*% coef_X + rnorm(n,0,1)
+      
+      X_knockoffs = create.second_order(X_matrix, method = 'equi', shrink=T)
+      X_matrix = cbind(X_matrix, X_knockoffs)
+      
+      
+      cvfit <- cv.glmnet(X_matrix, Y, intercept = F, standardize = F)
+      lambda <- cvfit$lambda.min
+      beta1 <- as.vector(glmnet(X_matrix, Y, alpha = 1, lambda = lambda, intercept = F, standardize = F)$beta)
+      index_beta1 = which(beta1 == 0)
+      
+      ## Get the debiased Lasso estimator
+      M1 = get_M(X_matrix)
+      beta1_d = as.numeric(beta1 + 1/n*M1%*%t(X_matrix)%*%(Y - X_matrix %*% beta1))
+      
+      ## Get the variance for the debiased Lasso estimator (up to a scaling factor)
+      sigma1 = sqrt(diag(M1%*%(t(X_matrix)%*%diag(diag((Y-X_matrix%*%beta1)%*%t(Y-X_matrix%*%beta1)))%*%X_matrix/(n/1))%*%t(M1)))
+      
+      tmp = beta1_d/sigma1
+      X1 = tmp[1:(d_X)] - tmp[(d_X+1):(d_X*2)]
+      X2 = tmp[1:(d_X)] + tmp[(d_X+1):(d_X*2)]
+      
+      index1 = intersect(which(X1>0),which(X2>0))
+      index2 = intersect(which(X1<0),which(X2>0))
+      index3 = intersect(which(X1<0),which(X2<0))
+      index4 = intersect(which(X1>0),which(X2<0))
+      
+      X1_4444 = c(X1[c(index2,index4)])
+      X2_4444 = c(X2[c(index2,index4)])
+      
+      h0 = c(bandwidth.nrd(X1_4444), bandwidth.nrd(X2_4444))
+      h1 = c(bandwidth.nrd(X1), bandwidth.nrd(X2))
+      
+      Kernel_h0 = function(x){0.3*sum(dnorm((x[1] - X1_4444)/h0[1])*dnorm((x[2] - X2_4444)/h0[2]))/(h0[1]*h0[2]*length(X1_4444))}
+      f0_hat0 = function(x){
+        return(0.25*(Kernel_h0(x) + Kernel_h0(c(-x[1],x[2])) + Kernel_h0(c(x[1],-x[2])) + Kernel_h0(-x)))
+      }
+      f0_hat = function(x){
+        return(0.5*(f0_hat0(x) + f0_hat0(c(x[2],x[1]))))
+      }
+      
+      Kernel_h1 = function(x){sum(dnorm((x[1] - X1)/h1[1])*dnorm((x[2] - X2)/h1[2]))/(h1[1]*h1[2]*length(X1))}
+      f_hat = function(x){
+        return(0.5*(Kernel_h1(x) + Kernel_h1(c(x[2],x[1]))))
+      }
+      
+      Lfdr_hat13 = function(x){min(1,(f0_hat(x)/f_hat(x)))}
+      lfdr_points_2 = rep(1,2*length(index2))
+      lfdr_points_4 = rep(1,2*length(index4))
+      lfdr_points13 = lfdr_points13 = rep(1,length(c(index1,index3)))
+      lfdr_points13 = apply(cbind(X1[c(index1,index3)],X2[c(index1,index3)]), 1, Lfdr_hat13)
+      lfdr_points_2= apply(cbind(c(X1[index2],-X1[index2]),c(-X2[index2], X2[index2])), 1, function(x){min(1,f0_hat(x)/f_hat(x))})
+      lfdr_points_4= apply(cbind(c(-X1[index4],X1[index4]),c(X2[index4], -X2[index4])), 1, function(x){min(1,f0_hat(x)/f_hat(x))})
+      
+      get_localfdr_threshold_half <- function(lfdr13, lfdr2, lfdr4,q_fdr){
+        t = sort(c(lfdr13,lfdr2,lfdr4))
+        t[t==1]=0.9999
+        Ta = sapply(t,function(x){(0.5*(length(lfdr4[lfdr4<=x]) + length(lfdr2[lfdr2<=x])))/max(1,length(lfdr13[lfdr13<=x]))})
+        sh = max(t[which(Ta<=q_fdr)]) 
+        
+        return(sh)
+      }
+      
+      
+      fdr_q = get_localfdr_threshold_half(lfdr_points13, lfdr_points_2, lfdr_points_4, q_fdr)
+      label_X1X2_13 = label_X1X2[c(index1,index3)]
+      number_d = length(which(lfdr_points13<=fdr_q))
+      number_td = length(intersect(which(lfdr_points13<=fdr_q), which(label_X1X2_13 != 'Null')))
+      
+      get_conventional_threshold <- function(S, q_fdr){
+        t = sort(abs(S))
+        Ta = sapply(t,function(x){(length(S[S<(-x)]))/max(1,length(S[S>x]))})
+        sh = min(t[which(Ta<=q_fdr)])
+        return(sh)
+      }
+      
+      S_tol = X1*X2
+      sh = get_conventional_threshold(S_tol,q_fdr)
+      S_fdr = length(intersect(which(S_tol > sh), which(label_X1X2 == 'Null'))) / max(length(which(S_tol >= sh)),1)
+      S_power = length(intersect(which(S_tol > sh), which(label_X1X2 != 'Null'))) / (d_X - d_h0)
+      
+      SPlus_tol = sign(X1*X2)*(abs(X1) + abs(X2))
+      sh = get_conventional_threshold(SPlus_tol,q_fdr)
+      SPlus_fdr = length(intersect(which(SPlus_tol > sh), which(label_X1X2 == 'Null'))) / max(length(which(SPlus_tol > sh)),1)
+      SPlus_power = length(intersect(which(SPlus_tol > sh), which(label_X1X2 != 'Null'))) / (d_X - d_h0)
+      
+      Smin_tol = 2*sign(X1*X2)*apply(cbind(abs(X1), abs(X2)), 1, min)
+      sh = get_conventional_threshold(Smin_tol,q_fdr)
+      Smin_fdr = length(intersect(which(Smin_tol > sh), which(label_X1X2 == 'Null'))) / max(length(which(Smin_tol > sh)),1)
+      Smin_power = length(intersect(which(Smin_tol > sh), which(label_X1X2 != 'Null'))) / (d_X - d_h0)      
+      DD_fdr = (number_d - number_td)/ max(1,number_d)
+      DD_power = (number_td)/(d_X-d_h0)
+
+      return(list(DD_fdr, DD_power, S_fdr, S_power, SPlus_fdr, SPlus_power, Smin_fdr, Smin_power))
+    }
+    
+    for (i in 1:Rep_times) {
+      DD_fdr_list[i]  = Output_fdr_power[[i]][[1]]
+      DD_power_list[i]  = Output_fdr_power[[i]][[2]]
+      S_fdr_list[i]  = Output_fdr_power[[i]][[3]]
+      S_power_list[i]  = Output_fdr_power[[i]][[4]]
+      SPlus_fdr_list[i]  = Output_fdr_power[[i]][[5]]
+      SPlus_power_list[i]  = Output_fdr_power[[i]][[6]]
+      Smin_fdr_list[i]  = Output_fdr_power[[i]][[7]]
+      Smin_power_list[i]  = Output_fdr_power[[i]][[8]]
+    }
+    
+    DD_fdr_list  = unlist(DD_fdr_list)
+    DD_power_list  = unlist(DD_power_list)
+    S_fdr_list  = unlist(S_fdr_list)
+    S_power_list  = unlist(S_power_list)
+    SPlus_fdr_list  = unlist(SPlus_fdr_list)
+    SPlus_power_list  = unlist(SPlus_power_list)
+    Smin_fdr_list  = unlist(Smin_fdr_list)
+    Smin_power_list  = unlist(Smin_power_list)
+    
+    output = data.frame(DD_fdr_list, S_fdr_list,SPlus_fdr_list, Smin_fdr_list, DD_power_list, S_power_list, SPlus_power_list, Smin_power_list)
+    
+    output_table_fdr_power = rbind(output_table_fdr_power, output)
+    output_table_fdr[(4*(k-1)+1):(4*k),k_mag] = c(mean(DD_fdr_list),mean(S_fdr_list) ,mean(SPlus_fdr_list) ,mean(Smin_fdr_list))
+    output_table_power[(4*(k-1)+1):(4*k),k_mag] = c(mean(DD_power_list), mean(S_power_list), mean(SPlus_power_list), mean(Smin_power_list))
+
+  }
+}
+
+Parameter_proportion= rep(names_mag, each= Rep_times, time = length(parameter_proportion))
+output_table_fdr_power = cbind(output_table_fdr_power, Parameter_proportion)
+colnames(output_table_fdr_power) = c('Adaptive_fdr', 'Times_fdr', 'Plus_fdr', 'Min_fdr',
+                                     'Adaptive_power', 'Times_power', 'Plus_power', 'Min_power','Parameter_proportion')
+
+stopImplicitCluster()
+stopCluster(cl)
+
+plot_data4 = data.frame(Power = output_table_power[,1], FDR = output_table_fdr[,1], `Threshold` = rep(c('Adaptive', 'KSCD', 'KLSM', 'KLCD'), length(parameter_proportion)), `delta` = rep(factor(parameter_proportion, level = as.character(parameter_proportion)), each=4))
+plot_data4[which(plot_data4$Threshold =='Adaptive'),3] = 'SAS'
+plot_data4$Threshold = factor(plot_data4$Threshold, levels = c('SAS', 'KSCD', 'KLSM', 'KLCD'),labels = c('SAS', 'KSCD', 'KLSM', 'KLCD'))
+
+Fig_power4 =  ggplot() +
+  geom_point(data = plot_data4, aes(x = delta, y= Power, color = Threshold, shape = Threshold), alpha =0.85) +
+  geom_line(data = plot_data4, aes(x = delta, y= Power, group = Threshold,color = Threshold, linetype = Threshold)) +
+  xlab(element_blank()) +
+  ylab(element_blank()) +
+  theme_bw() +
+  theme(legend.title=element_blank(),
+        legend.key = element_rect(colour = "transparent", fill = "transparent"),
+        legend.background= element_rect(colour = "transparent", fill = "transparent"))
+
+Fig_FDR4 =  ggplot() +
+  geom_point(data = plot_data4, aes(x = delta, y= FDR, color = Threshold, shape = Threshold), alpha =0.85) +
+  geom_line(data = plot_data4, aes(x = delta, y= FDR, group = Threshold,color = Threshold, linetype = Threshold)) +
+  ylim(c(0,0.3)) +
+  xlab("p") +
+  ylab(element_blank()) +
+  theme_bw() +
+  geom_hline(yintercept = q_fdr, linetype='dashed', alpha=0.5) +
+  theme(legend.title=element_blank(),
+        legend.key = element_rect(colour = "transparent", fill = "transparent"),
+        legend.background= element_rect(colour = "transparent", fill = "transparent"))
+
+Fig1 = Fig_power1 + Fig_power4 + Fig_FDR1 + Fig_FDR4 + plot_layout(ncol = 2, guides = 'collect') & theme(legend.position='bottom')
+ggsave('Figures/knock_50_150.jpg',Fig1, width = 5.5, height = 5.5, dpi = 400)
+```
+
+```{r}
+Fig1
+```
