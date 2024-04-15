@@ -13,6 +13,7 @@ Step 2: Run the simulations of Section 5 and Appendix B-C. Codes are in Folder �
 (4). Run the file “Figures_1_2.Rmd” for checking Figures 3-4.
 (5). Run the files “DS_1234_final.Rmd” for checking Figures 5 and C6, “DS_5_final.Rmd” for checking Figures 6 and C7, “Knock_1234_final.Rmd” for checking Figures 7 and C8, “Knock_5_final.Rmd” for checking Figures 8 and C9 in turn.
 (6). Run the file “Consistency_plot.Rmd” for checking Figure B1.
+(7). Run the file “DS_p50_200_final.Rmd” for checking Figure C2, “Knockoff_small_p.Rmd” for checking Figure C3.
  
 Step 3: Run the real data analysis of Section 6 and Appendix C. Codes are in Folder “Real_data”.
 (1). Check the path of .Rmd file and set it as a working directory before you run the codes.
