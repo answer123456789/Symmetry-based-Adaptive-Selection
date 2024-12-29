@@ -1,0 +1,493 @@
+---
+title: "Figures 3-4"
+date: '2024-03-15'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+```
+
+```{r, results='hide'}
+path = dirname(rstudioapi::getActiveDocumentContext()$path)
+setwd(path)
+library(MASS) 
+library(ggplot2)
+library(knockoff)
+library(glmnet)
+library(ggthemes)
+library(patchwork)
+source('Functions.R')
+
+seeds=66 
+set.seed(seeds)
+n = 400
+q_fdr = 0.2
+negative = 0.9
+positive = 1 - negative
+d_X = 600
+d_h1 = 30
+d_h0 = d_X-d_h1
+label_X1X2 = c(rep('Null', d_h0), rep('Non-null', d_h1))
+posi_len = round(positive*d_h1)
+nega_len = d_h1 - posi_len
+c1 = rep(0.35,round(posi_len))
+c2 = rep(-0.25,round(nega_len))
+coef_X = matrix(c(rep(0,d_h0), c1, c2), d_X) 
+Sigma = diag(1,d_X,d_X)
+for (i in 1:d_X) {
+  for (j in 1:d_X) {
+    Sigma[i,j] = 0.5^abs(i-j)
+  }
+}
+X_matrix = mvrn(n, rep(0,d_X), Sigma)
+X_matrix = X_matrix[,sample(d_X)]
+Y = X_matrix %*% coef_X + rnorm(n,0,1)
+n_index = sample(n,n/2)
+X_matrix1 = X_matrix[n_index,]
+X_matrix2 = X_matrix[setdiff(c(1:n), n_index),]
+Y1 = Y[n_index,]
+Y2 = Y[setdiff(c(1:n), n_index),]
+
+cvfit <- cv.glmnet(X_matrix, Y, intercept = F, standardize = F)
+lambda <- cvfit$lambda.min
+beta1 <- as.vector(glmnet(X_matrix1, Y1, alpha = 1, lambda = lambda, intercept = F, standardize = F)$beta)
+beta2 <- as.vector(glmnet(X_matrix2, Y2, alpha = 1, lambda = lambda, intercept = F, standardize = F)$beta)
+index_beta1 = which(beta1 == 0)
+index_beta2 = which(beta2 == 0)
+
+M1 = get_M(X_matrix1)
+M2 = get_M(X_matrix2)
+beta1_d = as.numeric(beta1 + 2/n*M1%*%t(X_matrix1)%*%(Y1 - X_matrix1 %*% beta1))
+beta2_d = as.numeric(beta2 + 2/n*M2%*%t(X_matrix2)%*%(Y2 - X_matrix2 %*% beta2))
+sigma1 = sqrt(diag(M1%*%(t(X_matrix1)%*%diag(diag((Y1-X_matrix1%*%beta1)%*%t(Y1-X_matrix1%*%beta1)))%*%X_matrix1/(n/2))%*%t(M1)))
+sigma2 = sqrt(diag(M2%*%(t(X_matrix2)%*%diag(diag((Y2-X_matrix2%*%beta2)%*%t(Y2-X_matrix2%*%beta2)))%*%X_matrix2/(n/2))%*%t(M2)))
+
+X1 = beta1_d/sigma1
+X2 = beta2_d/sigma2
+plot_lim = ceiling(max(c(abs(X1), abs(X2))))
+
+index1 = intersect(which(X1>0),which(X2>0))
+index2 = intersect(which(X1<0),which(X2>0))
+index3 = intersect(which(X1<0),which(X2<0))
+index4 = intersect(which(X1>0),which(X2<0))
+
+X1_4444 = c(X1[c(index2,index4)])
+X2_4444 = c(X2[c(index2,index4)])
+
+h0 = 1.0*c(bandwidth.nrd(X1_4444), bandwidth.nrd(X2_4444))
+h1 = 1.4*c(bandwidth.nrd(X1), bandwidth.nrd(X2))
+
+Kernel_h0 = function(x){0.3*sum(dnorm((x[1] - X1_4444)/h0[1])*dnorm((x[2] - X2_4444)/h0[2]))/(h0[1]*h0[2]*length(X1_4444))}
+f0_hat0 = function(x){
+  return(0.25*(Kernel_h0(x) + Kernel_h0(c(-x[1],x[2])) + Kernel_h0(c(x[1],-x[2])) + Kernel_h0(-x)))
+}
+f0_hat = function(x){
+  return(0.5*(f0_hat0(x) + f0_hat0(c(x[2],x[1]))))
+}
+Kernel_h1 = function(x){sum(dnorm((x[1] - X1)/h1[1])*dnorm((x[2] - X2)/h1[2]))/(h1[1]*h1[2]*length(X1))}
+f_hat = function(x){
+  return(0.5*(Kernel_h1(x) + Kernel_h1(c(x[2],x[1]))))
+}
+
+Lfdr_hat13 = function(x){min(1,(f0_hat(x)/f_hat(x)))}
+lfdr_points_2 = rep(1,2*length(index2))
+lfdr_points_4 = rep(1,2*length(index4))
+lfdr_points13 = lfdr_points13 = rep(1,length(c(index1,index3)))
+lfdr_points13 = apply(cbind(X1[c(index1,index3)],X2[c(index1,index3)]), 1, Lfdr_hat13)
+lfdr_points_2= apply(cbind(c(X1[index2],-X1[index2]),c(-X2[index2], X2[index2])), 1, function(x){min(1,f0_hat(x)/f_hat(x))})
+lfdr_points_4= apply(cbind(c(-X1[index4],X1[index4]),c(X2[index4], -X2[index4])), 1, function(x){min(1,f0_hat(x)/f_hat(x))})
+
+get_localfdr_threshold_half <- function(lfdr13, lfdr2, lfdr4,q_fdr){
+  t = sort(c(lfdr13,lfdr2,lfdr4))
+  t[t==1]=0.9999
+  Ta = sapply(t,function(x){(1+0.5*(length(lfdr4[lfdr4<=x])+ length(lfdr2[lfdr2<=x])))/max(1,length(lfdr13[lfdr13<=x]))})
+  sh = max(t[which(Ta<=q_fdr)]) 
+  return(sh)
+}
+fdr_q = get_localfdr_threshold_half(lfdr_points13, lfdr_points_2, lfdr_points_4, q_fdr)
+label_X1X2_13 = label_X1X2[c(index1,index3)]
+number_d = length(which(lfdr_points13<fdr_q))
+number_td = length(intersect(which(lfdr_points13<fdr_q), which(label_X1X2_13 != 'Null')))
+
+get_conventional_threshold <- function(S, q_fdr){
+  t = sort(abs(S))
+  Ta = sapply(t,function(x){(1+length(S[S<(-x)]))/max(1,length(S[S>x]))})
+  sh = min(t[which(Ta<=q_fdr)]) 
+  return(sh)
+}
+
+S_tol = X1*X2
+sh1 = get_conventional_threshold(S_tol,q_fdr)
+SPlus_tol = sign(X1*X2)*(abs(X1) + abs(X2))
+sh2 = get_conventional_threshold(SPlus_tol,q_fdr)
+Smin_tol = 2*sign(X1*X2)*apply(cbind(abs(X1), abs(X2)), 1, min)
+sh3 = get_conventional_threshold(Smin_tol,q_fdr)
+
+
+
+x <- c(seq(-1,-sh1,0.0001), seq(sh1,1,0.0001))
+y = sh1/x
+
+data <- data.frame(x=x, y=y, lower = c(rep(min(y),length(x)/2), y[(length(x)/2+1):length(x)]), upper = c(y[1:(length(x)/2)], rep(max(y),length(x)/2)))
+data1 <- data.frame(x=x, y=-y, lower = c(-y[1:(length(x)/2)], rep(min(y),length(x)/2)), upper = c(rep(max(y),length(x)/2), -y[(length(x)/2+1):length(x)]))
+
+data_point = data.frame(X1, X2, Label =  label_X1X2)
+Fig1 = ggplot(data = data, aes(x=x,y=y)) + 
+  geom_ribbon(aes(ymin=lower, ymax=upper, x=x), fill = "#a3cd5b", alpha = 0.8)+
+  geom_ribbon(data = data1, aes(ymin=lower, ymax=upper, x=x), fill = "#8ea0cc", alpha = 0.8)+
+  geom_point(data = data_point, aes(x=X1,y=X2,fill=`Label`,shape = `Label`, alpha = `Label`),size = 1.5)+
+  scale_fill_manual(values = c("Non-null"="#a3cd5b",
+                               "Null"="#8ea0cc")) +
+  scale_alpha_discrete(range = c(0.9, 0.235)) + 
+  scale_shape_manual(values = c(21,22))+
+  xlim(c(-1,1))+
+  ylim(c(-1,1))+
+  geom_hline(yintercept = 0, alpha = 0.7) +
+  geom_vline(xintercept = 0, alpha = 0.7) +
+  xlab(expression(italic(t^(1))))+
+  ylab(expression(italic(t^(2))))+
+  annotate("text", x = -max(x)*0.6, y = -max(y)*0.6, parse = TRUE, color = 'black',size = 4, label = "italic(G)") +
+  annotate("text", x = max(x)*0.6, y = max(y)*0.6, parse = TRUE, color = 'black',size = 4, label = "italic(G)") +
+  annotate("text", x = -max(x)*0.6, y = max(y)*0.6, parse = TRUE, color = 'black',size = 4, label = "paste(italic(G),`'`[1])") +
+  annotate("text", x = max(x)*0.6, y = -max(y)*0.6, parse = TRUE, color = 'black',size = 4, label = "paste(italic(G),`'`[1])") +
+  theme_bw() + 
+  labs(caption="DM")+
+  theme(legend.position = 'none',
+        axis.text = element_text(family = "serif",size = 1),
+        axis.ticks = element_blank(),
+        plot.caption = element_text(hjust=0.5, size=rel(1.1)))
+
+ntau= round(100*(1-sh2))
+x1 <- c(seq(-1,0,0.01), seq(0,1,0.01))
+tau = -x1[ntau]
+y1 = c(rep(0,ntau), (-tau-x1[(ntau+1):101]), (tau-x1[102:(102+100-ntau)]), rep(0,ntau))
+
+f2 <- data.frame(x=x1, y=y1, lower = c(rep(-1,length(x1)/2), y1[(length(x1)/2+1):length(x1)]), upper = c(y1[1:(length(x1)/2)], rep(1,length(x1)/2)))
+f22 <- data.frame(x=x1, y=-y1, lower = c(-y1[1:(length(x1)/2)], rep(-1,length(x1)/2)), upper = c(rep(1,length(x1)/2), -y1[(length(x1)/2+1):length(x1)]))
+
+
+Fig2 = ggplot(data = f2, aes(x=x1,y=y1)) + 
+  geom_ribbon(data = f2, aes(ymin=lower, ymax=upper, x=x1), fill = "#a3cd5b", alpha = 0.8)+
+  geom_ribbon(data = f22, aes(ymin=lower, ymax=upper, x=x1), fill = "#8ea0cc", alpha = 0.8)+
+  geom_point(data = data_point, aes(x=X1,y=X2,fill=`Label`,shape = `Label`, alpha = `Label`),size = 1.5)+
+  scale_fill_manual(values = c("Non-null"="#a3cd5b",
+                               "Null"="#8ea0cc")) +
+  scale_alpha_discrete(range = c(0.9, 0.235)) + 
+  scale_shape_manual(values = c(21,22))+
+  xlim(c(-1,1))+
+  ylim(c(-1,1))+
+  geom_hline(yintercept = 0, alpha = 0.7) +
+  geom_vline(xintercept = 0, alpha = 0.7) +
+  xlab(expression(italic(t^(1))))+
+  ylab(expression(italic(t^(2))))+
+  annotate("text", x = -max(x1)*0.6, y = -1*0.6, parse = TRUE, color = 'black',size = 4, label = "italic(G)") +
+  annotate("text", x = max(x1)*0.6, y = 1*0.6, parse = TRUE, color = 'black',size = 4, label = "italic(G)") +
+  annotate("text", x = -max(x1)*0.6, y = 1*0.6, parse = TRUE, color = 'black',size = 4, label = "paste(italic(G),`'`[1])") +
+  annotate("text", x = max(x1)*0.6, y = -1*0.6, parse = TRUE, color = 'black',size = 4, label = "paste(italic(G),`'`[1])") +
+  theme_bw() + 
+  labs(caption="DSA")+
+  theme(legend.position = 'none',
+        axis.text = element_text(family = "serif",size = 1),
+        axis.ticks = element_blank(),
+        plot.caption = element_text(hjust=0.5, size=rel(1.1)))
+
+tau3 = sh3/2
+x3 <- c(seq(-1,-tau3,0.01), seq(tau3,1,0.01))
+y3 = c(rep(-tau3,length(x3)/2), rep(tau3,length(x3)/2))
+
+f3 <- data.frame(x=x3, y=y3, lower = c(rep(-1,length(x3)/2), y3[(length(x3)/2+1):length(x3)]), upper = c(y3[1:(length(x3)/2)], rep(1,length(x3)/2)))
+f33 <- data.frame(x=x3, y=-y3, lower = c(-y3[1:(length(x3)/2)], rep(-1,length(x3)/2)), upper = c(rep(1,length(x3)/2), -y3[(length(x3)/2+1):length(x3)]))
+
+a1 = f3[1:(length(x3)/2),]
+colnames(a1) = c("a1x", "a1y", "a1_lower", "a1_upper")
+a11 = f33[1:(length(x3)/2),]
+colnames(a11) = c("a11x", "a11y", "a11_lower", "a11_upper")
+a2 = f3[(length(x3)/2+1):length(x3),]
+colnames(a2) = c("a2x", "a2y", "a2_lower", "a2_upper")
+a22 = f33[(length(x3)/2+1):length(x3),]
+colnames(a22) = c("a22x", "a22y", "a22_lower", "a22_upper")
+Fig3 = ggplot() + 
+  geom_ribbon(data = a1, aes(ymin=a1_lower, ymax=a1_upper, x=a1x), fill = "#a3cd5b", alpha = 0.8) + 
+  geom_ribbon(data = a2, aes(ymin=a2_lower, ymax=a2_upper, x=a2x), fill = "#a3cd5b", alpha = 0.8) + 
+  geom_ribbon(data = a11, aes(ymin=a11_lower, ymax=a11_upper, x=a11x), fill = "#8ea0cc", alpha = 0.8) + 
+  geom_ribbon(data = a22, aes(ymin=a22_lower, ymax=a22_upper, x=a22x), fill = "#8ea0cc", alpha = 0.8) + 
+  geom_point(data = data_point, aes(x=X1,y=X2,fill=`Label`,shape = `Label`, alpha = `Label`),size = 1.5)+
+  scale_fill_manual(values = c("Non-null"="#a3cd5b",
+                               "Null"="#8ea0cc")) +
+  scale_alpha_discrete(range = c(0.9, 0.235)) + 
+  scale_shape_manual(values = c(21,22))+
+  xlim(c(-1,1))+
+  ylim(c(-1,1))+
+  geom_hline(yintercept = 0, alpha = 0.7) +
+  geom_vline(xintercept = 0, alpha = 0.7) +
+  xlab(expression(italic(t^(1))))+
+  ylab(expression(italic(t^(2))))+
+  annotate("text", x = -1*0.6, y = -1*0.6, parse = TRUE, color = 'black',size = 4, label = "italic(G)") +
+  annotate("text", x = 1*0.6, y = 1*0.6, parse = TRUE, color = 'black',size = 4, label = "italic(G)") +
+  annotate("text", x = -1*0.6, y = 1*0.6, parse = TRUE, color = 'black',size = 4, label = "paste(italic(G),`'`[1])") +
+  annotate("text", x = 1*0.6, y = -1*0.6, parse = TRUE, color = 'black',size = 4, label = "paste(italic(G),`'`[1])") +
+  theme_bw() + 
+  labs(caption="DSM")+
+  theme(legend.position = 'none',
+        axis.text = element_text(family = "serif",size = 1),
+        axis.ticks = element_blank(),
+        plot.caption = element_text(hjust=0.5, size=rel(1.1)))
+
+unit = 0.005
+p1 = p2= c(seq(-1,-unit,unit),seq(unit,1,unit))
+p = expand.grid(p1,p2)
+p = p[which(p$Var1*p$Var2>0),]
+Lfdr = apply(p, 1, Lfdr_hat13)
+Lfdr[is.na(Lfdr)] = 0
+plot_data_fdr1 = cbind(p,Lfdr)
+plot_data_fdr1 = plot_data_fdr1[which(plot_data_fdr1$Lfdr < fdr_q),]
+
+loc_fdr_region <- ggplot(plot_data_fdr1) +
+  geom_point(aes(x = Var1, y = Var2), fill = "#a3cd5b", color = "#a3cd5b", alpha=0.056,size=0.7) +
+  geom_point(aes(x = -Var1, y = Var2), fill = "#8ea0cc", color = "#8ea0cc", alpha=0.035,size=0.7) +
+  geom_point(data = data_point, aes(x=X1,y=X2,fill=`Label`,shape = `Label`, alpha = `Label`),size = 1.5)+
+  scale_fill_manual(values = c("Non-null"="#a3cd5b",
+                               "Null"="#8ea0cc")) +
+  scale_alpha_discrete(range = c(0.9, 0.235)) + 
+  scale_shape_manual(values = c(21,22))+
+  theme_bw() +
+  xlim(c(-1,1)) +
+  ylim(c(-1,1)) +
+  geom_hline(yintercept = 0, linetype = "solid", alpha = 0.7) +
+  geom_vline(xintercept = 0, linetype = "solid", alpha = 0.7) +
+  xlab(expression(italic(t^(1))))+
+  ylab(expression(italic(t^(2)))) + 
+  annotate("text", x = -1*0.6, y = -1*0.6, parse = TRUE, color = 'black',size = 4, label = "italic(G)") +
+  annotate("text", x = 1*0.6, y = 1*0.6, parse = TRUE, color = 'black',size = 4, label = "italic(G)") +
+  annotate("text", x = -1*0.6, y = 1*0.6, parse = TRUE, color = 'black',size = 4, label = "paste(italic(G),`'`[1])") +
+  annotate("text", x = 1*0.6, y = -1*0.6, parse = TRUE, color = 'black',size = 4, label = "paste(italic(G),`'`[1])") +
+  theme_bw() + 
+  labs(caption="SAS")+
+  theme(legend.position = 'none',
+        axis.text = element_text(family = "serif",size = 1),
+        axis.ticks = element_blank(),
+        plot.caption = element_text(hjust=0.5, size=rel(1.1)))
+
+
+Fig_DS = loc_fdr_region +Fig1+ Fig2 +  Fig3 +  plot_layout(ncol = 4)
+ggsave('Figure_3.jpg',Fig_DS, width = 12, height = 3.35, dpi = 600)
+```
+
+```{r, fig.width = 12, fig.height = 3.35}
+Fig_DS
+```
+
+
+```{r, results='hide'}
+set.seed(99)
+X_matrix = mvrn(n, rep(0,d_X), Sigma)
+X_matrix = X_matrix[,sample(d_X)]
+Y = X_matrix %*% coef_X + rnorm(n,0,1)
+
+X_knockoffs = create.second_order(X_matrix, method = 'equi')
+X_matrix = cbind(X_matrix, X_knockoffs)
+
+cvfit <- cv.glmnet(X_matrix, Y, intercept = F, standardize = F)
+lambda <- cvfit$lambda.min
+beta1 <- as.vector(glmnet(X_matrix, Y, alpha = 1, lambda = lambda, intercept = F, standardize = F)$beta)
+index_beta1 = which(beta1 == 0)
+M1 = get_M(X_matrix)
+beta1_d = as.numeric(beta1 + 1/n*M1%*%t(X_matrix)%*%(Y - X_matrix %*% beta1))
+sigma1 = sqrt(diag(M1%*%(t(X_matrix)%*%diag(diag((Y-X_matrix%*%beta1)%*%t(Y-X_matrix%*%beta1)))%*%X_matrix/(n/1))%*%t(M1)))
+
+tmp = beta1_d/sigma1
+X1 = tmp[1:(d_X)] - tmp[(d_X+1):(d_X*2)]
+X2 = tmp[1:(d_X)] + tmp[(d_X+1):(d_X*2)]
+
+index1 = intersect(which(X1>0),which(X2>0))
+index2 = intersect(which(X1<0),which(X2>0))
+index3 = intersect(which(X1<0),which(X2<0))
+index4 = intersect(which(X1>0),which(X2<0))
+
+X1_4444 = c(X1[c(index2,index4)])
+X2_4444 = c(X2[c(index2,index4)])
+
+h0 = 1.0*c(bandwidth.nrd(X1_4444), bandwidth.nrd(X2_4444))
+h1 = 1.4*c(bandwidth.nrd(X1), bandwidth.nrd(X2))
+
+lfdr_points_2 = rep(1,2*length(index2))
+lfdr_points_4 = rep(1,2*length(index4))
+lfdr_points13 = lfdr_points13 = rep(1,length(c(index1,index3)))
+lfdr_points13 = apply(cbind(X1[c(index1,index3)],X2[c(index1,index3)]), 1, Lfdr_hat13)
+lfdr_points_2= apply(cbind(c(X1[index2],-X1[index2]),c(-X2[index2], X2[index2])), 1, function(x){min(1,f0_hat(x)/f_hat(x))})
+lfdr_points_4= apply(cbind(c(-X1[index4],X1[index4]),c(X2[index4], -X2[index4])), 1, function(x){min(1,f0_hat(x)/f_hat(x))})
+
+fdr_q = get_localfdr_threshold_half(lfdr_points13, lfdr_points_2, lfdr_points_4, q_fdr)
+label_X1X2_13 = label_X1X2[c(index1,index3)]
+number_d = length(which(lfdr_points13<=fdr_q))
+number_td = length(intersect(which(lfdr_points13<=fdr_q), which(label_X1X2_13 != 'Null')))
+
+
+S_tol = X1*X2
+sh1 = get_conventional_threshold(S_tol,q_fdr)
+SPlus_tol = sign(X1*X2)*(abs(X1) + abs(X2))
+sh2 = get_conventional_threshold(SPlus_tol,q_fdr)
+Smin_tol = 2*sign(X1*X2)*apply(cbind(abs(X1), abs(X2)), 1, min)
+sh3 = get_conventional_threshold(Smin_tol,q_fdr)
+
+DD_fdr = (number_d - number_td)/ max(1,number_d)
+DD_power = (number_td)/(d_X-d_h0)
+
+data_point = data.frame(X1*sqrt(2), X2*sqrt(2), Label =  label_X1X2)
+unit = 0.005
+
+p1 = p2= c(seq(-1,-unit,unit),seq(unit,1,unit))
+p = expand.grid(p1,p2)
+p = p[which(p$Var1*p$Var2>0),]
+Lfdr = apply(p, 1, Lfdr_hat13)
+Lfdr[is.na(Lfdr)] = 0
+plot_data_fdr1 = cbind(p,Lfdr)
+plot_data_fdr1 = plot_data_fdr1[which(plot_data_fdr1$Lfdr < fdr_q),]
+
+loc_fdr_region <- ggplot(plot_data_fdr1) +
+  geom_point(aes(x = Var1, y = Var2), fill = "#a3cd5b", color = "#a3cd5b", alpha=0.056,size=0.7) +
+  geom_point(aes(x = -Var1, y = Var2), fill = "#8ea0cc", color = "#8ea0cc", alpha=0.035,size=0.7) +
+  geom_point(data = data_point, aes(x=X1,y=X2,fill=`Label`,shape = `Label`, alpha = `Label`),size = 1.5)+
+  scale_fill_manual(values = c("Non-null"="#a3cd5b",
+                               "Null"="#8ea0cc")) +
+  scale_alpha_discrete(range = c(0.9, 0.235)) + 
+  scale_shape_manual(values = c(21,22))+
+  theme_bw() +
+  xlim(c(-1,1)) +
+  ylim(c(-1,1)) +
+  geom_hline(yintercept = 0, linetype = "solid", alpha = 0.7) +
+  geom_vline(xintercept = 0, linetype = "solid", alpha = 0.7) +
+  xlab(expression(italic(t^(1))))+
+  ylab(expression(italic(t^(2)))) + 
+  annotate("text", x = -1*0.6, y = -1*0.6, parse = TRUE, color = 'black',size = 4, label = "italic(G)") +
+  annotate("text", x = 1*0.6, y = 1*0.6, parse = TRUE, color = 'black',size = 4, label = "italic(G)") +
+  annotate("text", x = -1*0.6, y = 1*0.6, parse = TRUE, color = 'black',size = 4, label = "paste(italic(G),`'`[1])") +
+  annotate("text", x = 1*0.6, y = -1*0.6, parse = TRUE, color = 'black',size = 4, label = "paste(italic(G),`'`[1])") +
+  theme_bw() + 
+  labs(caption="SAS")+
+  theme(legend.position = 'none',
+        axis.text = element_text(family = "serif",size = 1),
+        axis.ticks = element_blank(),
+        plot.caption = element_text(hjust=0.5, size=rel(1.1)))
+
+
+T1 =  tmp[1:(d_X)] *sqrt(2)
+T2 = tmp[(d_X+1):(d_X*2)] *sqrt(2)
+data_pointT = data.frame(T1, T2, Label =  label_X1X2)
+
+tau1 = round(sh3/sqrt(2),2) 
+x1 <- seq(-1+tau1,1-tau1,0.01)
+y1 = c(-x1[1:((length(x1)+1)/2)] + tau1, x1[((length(x1)+1)/2 + 1):length(x1)] + tau1)
+
+
+data1 <- data.frame(x=x1, y=y1, lower = y1, upper =rep(1,length(x1)))
+data11 <- data.frame(x=x1, y=-y1, lower = rep(-1,length(x1)), upper = -y1)
+
+
+df_abline <- data.frame(intercept=c(0),slope=c(1))
+Fig1 = ggplot(data = data1, aes(x=x1,y=y1)) + 
+  geom_ribbon(aes(ymin=lower, ymax=upper, x=x1), fill = "#8ea0cc", alpha = 0.8)+
+  geom_ribbon(data = data11, aes(ymin=lower, ymax=upper, x=x1), fill = "#8ea0cc", alpha = 0.8) + 
+  geom_ribbon(aes(xmin=lower, xmax=upper, y=x1), orientation = 'y', fill = "#a3cd5b", alpha = 0.8) + 
+  geom_ribbon(data = data11, aes(xmin=lower, xmax=upper, y=x1), orientation = 'y', fill = "#a3cd5b", alpha = 0.8)+
+  geom_point(data = data_pointT, aes(x=T1,y=T2,fill=`Label`,shape = `Label`, alpha = `Label`),size = 1.5)+
+  scale_fill_manual(values = c("Non-null"="#a3cd5b",
+                               "Null"="#8ea0cc")) +
+  scale_alpha_discrete(range = c(0.9, 0.235)) + 
+  scale_shape_manual(values = c(21,22))+
+  xlim(c(-1,1))+
+  ylim(c(-1,1))+
+  geom_abline(data = df_abline, aes(intercept=intercept,slope=slope), alpha = 0.7)+
+  geom_abline(data = df_abline, aes(intercept=intercept,slope=-slope), alpha = 0.7)+
+  xlab(expression(italic(z)))+
+  ylab(expression(italic(tilde(z))))+
+  annotate("text", x = 0.7, y = 0, parse = TRUE, color = 'black',size = 4, label = "italic(G)") +
+  annotate("text", x = -0.7, y = 0, parse = TRUE, color = 'black',size = 4, label = "italic(G)") +
+  annotate("text", x = 0, y = 0.7, parse = TRUE, color = 'black',size = 4, label = "paste(italic(G),`'`[1])") +
+  annotate("text", x = 0, y = -0.7, parse = TRUE, color = 'black',size = 4, label = "paste(italic(G),`'`[1])") +
+  theme_bw() + 
+  labs(caption="KLSM")+
+  theme(legend.position = 'none',
+        axis.text = element_text(family = "serif",size = 1),
+        axis.ticks = element_blank(),
+        plot.caption = element_text(hjust=0.5, size=rel(1.1))) 
+
+tau3 =  round(sh2/sqrt(2.2),2) 
+x3 <- seq(-1,1,0.01)
+y3 = c(-x3[1:(100*(1-tau3))], rep(tau3,2*100*tau3), x3[((100*tau3)+101):length(x3)])
+data3 <- data.frame(x=x3, y=y3, lower = y3, upper =rep(1,length(x3)))
+data33 <- data.frame(x=x3, y=-y3, lower = rep(-1,length(x3)), upper = -y3)
+
+df_abline <- data.frame(intercept=c(0),slope=c(1))
+Fig3 = ggplot(data = data3, aes(x=x3,y=y3)) + 
+  geom_ribbon(aes(ymin=lower, ymax=upper, x=x3), fill = "#8ea0cc", alpha = 0.8)+
+  geom_ribbon(aes(xmin=lower, xmax=upper, y=x3), orientation = 'y', fill = "#a3cd5b", alpha = 0.8) + 
+  geom_ribbon(data=data33,aes(ymin=lower, ymax=upper, x=x3), fill = "#8ea0cc", alpha = 0.8)+
+  geom_ribbon(data=data33,aes(xmin=lower, xmax=upper, y=x3), orientation = 'y', fill = "#a3cd5b", alpha = 0.8) + 
+  geom_point(data = data_pointT, aes(x=T1,y=T2,fill=`Label`,shape = `Label`, alpha = `Label`),size = 1.5)+
+  scale_fill_manual(values = c("Non-null"="#a3cd5b",
+                               "Null"="#8ea0cc")) +
+  scale_alpha_discrete(range = c(0.9, 0.235)) + 
+  scale_shape_manual(values = c(21,22))+
+  geom_abline(data = df_abline, aes(intercept=intercept,slope=slope), alpha = 0.7)+
+  geom_abline(data = df_abline, aes(intercept=intercept,slope=-slope), alpha = 0.7)+
+  xlim(c(-1,1))+
+  ylim(c(-1,1))+
+  xlab(expression(italic(z)))+
+  ylab(expression(italic(tilde(z))))+
+  annotate("text", x = 0.7, y = 0, parse = TRUE, color = 'black',size = 4, label = "italic(G)") +
+  annotate("text", x = -0.7, y = 0, parse = TRUE, color = 'black',size = 4, label = "italic(G)") +
+  annotate("text", x = 0, y = 0.7, parse = TRUE, color = 'black',size = 4, label = "paste(italic(G),`'`[1])") +
+  annotate("text", x = 0, y = -0.7, parse = TRUE, color = 'black',size = 4, label = "paste(italic(G),`'`[1])") +
+  theme_bw() + 
+  labs(caption="KLCD")+
+  theme(legend.position = 'none',
+        axis.text = element_text(family = "serif",size = 1),
+        axis.ticks = element_blank(),
+        plot.caption = element_text(hjust=0.5, size=rel(1.1)),
+        plot.subtitle = element_text(family = "serif", size = 10, face = "bold", hjust = 0.5)) 
+
+tau2 = sh1/sqrt(2) + 0.005
+tau22 = 1 - (1-tau2)^2
+x2 <- seq(-1+tau2,1-tau2,0.01)
+y2 = sqrt(c(x2^2 + tau22))
+
+data2 <- data.frame(x=x2, y=y2, lower = y2, upper =rep(1,length(x2)))
+data22 <- data.frame(x=x2, y=-y2, lower = rep(-1,length(x2)), upper = -y2)
+
+df_abline <- data.frame(intercept=c(0),slope=c(1))
+Fig2 = ggplot(data = data2, aes(x=x2,y=y2)) + 
+  geom_ribbon(aes(ymin=lower, ymax=upper, x=x2), fill = "#8ea0cc", alpha = 0.8)+
+  geom_ribbon(aes(xmin=lower, xmax=upper, y=x2), orientation = 'y', fill = "#a3cd5b", alpha = 0.8) + 
+  geom_ribbon(data = data22, aes(ymin=lower, ymax=upper, x=x2), fill = "#8ea0cc", alpha = 0.8)+
+  geom_ribbon(data = data22, aes(xmin=lower, xmax=upper, y=x2), orientation = 'y', fill = "#a3cd5b", alpha = 0.8) +
+  geom_point(data = data_pointT, aes(x=T1,y=T2,fill=`Label`,shape = `Label`, alpha = `Label`),size = 1.5)+
+  scale_fill_manual(values = c("Non-null"="#a3cd5b",
+                               "Null"="#8ea0cc")) +
+  scale_alpha_discrete(range = c(0.9, 0.235)) + 
+  scale_shape_manual(values = c(21,22))+
+  geom_abline(data = df_abline, aes(intercept=intercept,slope=slope), alpha = 0.7)+
+  geom_abline(data = df_abline, aes(intercept=intercept,slope=-slope), alpha = 0.7)+
+  xlab(expression(italic(z)))+
+  ylab(expression(italic(tilde(z))))+
+  xlim(c(-1,1))+
+  ylim(c(-1,1))+
+  annotate("text", x = 0.7, y = 0, parse = TRUE, color = 'black',size = 4, label = "italic(G)") +
+  annotate("text", x = -0.7, y = 0, parse = TRUE, color = 'black',size = 4, label = "italic(G)") +
+  annotate("text", x = 0, y = 0.7, parse = TRUE, color = 'black',size = 4, label = "paste(italic(G),`'`[1])") +
+  annotate("text", x = 0, y = -0.7, parse = TRUE, color = 'black',size = 4, label = "paste(italic(G),`'`[1])") +
+  theme_bw() + 
+  labs(caption="KSCD")+
+  theme(legend.position = 'none',
+        axis.text = element_text(family = "serif",size = 1),
+        axis.ticks = element_blank(),
+        plot.caption = element_text(hjust=0.5, size=rel(1.1))) 
+
+Fig = loc_fdr_region +  Fig3 + Fig1 + Fig2 +  plot_layout(ncol = 4)
+ggsave('Figure_4.jpg',Fig, width = 12, height = 3.35, dpi = 600)
+```
+
+```{r, fig.width = 12, fig.height = 3.35}
+Fig
+```

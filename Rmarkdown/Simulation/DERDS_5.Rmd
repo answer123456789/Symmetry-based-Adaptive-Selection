@@ -1,0 +1,273 @@
+---
+title: "Derandomized Data Splitting Scenarios (v)"
+output: html_document
+date: "2024-08-11"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, results = 'hide'}
+path = dirname(rstudioapi::getActiveDocumentContext()$path)
+setwd(path)
+library(MASS) 
+library(ggplot2)
+library(glmnet)
+library(ggthemes)
+library(patchwork)
+library(doSNOW)
+library(foreach)
+library(doParallel)
+library(latex2exp)
+cl <- makeCluster(20, outfile = 'outs.out')
+registerDoParallel(cl)
+registerDoSNOW(cl)
+clusterEvalQ(cl = cl, RhpcBLASctl::blas_set_num_threads(1))
+
+n = 400
+q_fdr = 0.1
+Rep_times = 100
+seeds= 54321
+num_split = 20
+d_X = 1500
+d_h1 = 30
+d_h0 = d_X - d_h1
+label_X1X2 = c(rep('Null', d_h0), rep('Non-null', d_h1))
+Sigma = diag(1,d_X,d_X)
+for (i in 1:d_X) {
+  for (j in 1:d_X) {
+    Sigma[i,j] = 0.5^abs(i-j)
+  }
+}
+
+parameter_proportion = c(0.5,0.6,0.7,0.8,0.9,1)
+names = c('5:5','6:4','7:3','8:2','9:1','1:0')
+parameter_magnitude = c(0.25,0.4,0.55) 
+names_mag = c('025','040','050')
+
+output_table_fdr = data.frame(matrix(0,4*length(parameter_proportion),length(parameter_magnitude)))
+output_table_power = data.frame(matrix(0,4*length(parameter_proportion),length(parameter_magnitude)))
+
+DD_fdr_m = matrix(0,length(parameter_proportion),length(parameter_magnitude))
+DD_power_m = matrix(0,length(parameter_proportion),length(parameter_magnitude))
+S_fdr_m = matrix(0,length(parameter_proportion),length(parameter_magnitude))
+S_power_m = matrix(0,length(parameter_proportion),length(parameter_magnitude))
+SPlus_fdr_m = matrix(0,length(parameter_proportion),length(parameter_magnitude))
+SPlus_power_m = matrix(0,length(parameter_proportion),length(parameter_magnitude))
+Smin_fdr_m = matrix(0,length(parameter_proportion),length(parameter_magnitude))
+Smin_power_m = matrix(0,length(parameter_proportion),length(parameter_magnitude))
+
+Output_fdr_power <- foreach (time = 1:Rep_times, .packages =c('MASS', 'glmnet')) %dopar%  {
+  source('Functions.R')
+  set.seed(time+seeds)
+  print(Sys.time())
+  X_matrix = mvrn(n, rep(0,d_X), Sigma)
+  X_matrix = X_matrix[,sample(d_X)]
+  e = rnorm(n,0,1)
+
+  DD_fdr_matrix = matrix(0,length(parameter_proportion),length(parameter_magnitude))
+  DD_power_matrix = matrix(0,length(parameter_proportion),length(parameter_magnitude))
+  S_fdr_matrix = matrix(0,length(parameter_proportion),length(parameter_magnitude))
+  S_power_matrix = matrix(0,length(parameter_proportion),length(parameter_magnitude))
+  SPlus_fdr_matrix = matrix(0,length(parameter_proportion),length(parameter_magnitude))
+  SPlus_power_matrix = matrix(0,length(parameter_proportion),length(parameter_magnitude))
+  Smin_fdr_matrix = matrix(0,length(parameter_proportion),length(parameter_magnitude))
+  Smin_power_matrix = matrix(0,length(parameter_proportion),length(parameter_magnitude))
+  
+  DD_inclusion = S_inclusion = SPlus_inclusion = Smin_inclusion = array(0,dim = c(length(parameter_proportion), length(parameter_magnitude), d_X))
+  for (iter in 1:num_split) {
+    n_index = sample(n,n/2)
+    X_matrix1 = X_matrix[n_index,]
+    X_matrix2 = X_matrix[setdiff(c(1:n), n_index),]
+    M1 = get_M(X_matrix1)
+    M2 = get_M(X_matrix2)
+    for (ii in 1:length(parameter_proportion)) {
+      for (jj in 1:length(parameter_magnitude)) {
+        negative = parameter_proportion[ii]
+        positive = 1 - negative
+        posi_len = round(positive*d_h1)
+        nega_len = d_h1 - posi_len
+        magnitude = parameter_magnitude[jj]
+        c1 = rep(magnitude,round(posi_len))
+        c2 = rep(-0.25,round(nega_len))
+        coef_X = matrix(c(rep(0,d_h0), c1, c2), d_X) 
+        
+        Y = X_matrix %*% coef_X + e
+        Y1 = Y[n_index,]
+        Y2 = Y[setdiff(c(1:n), n_index),]
+        
+        cvfit <- cv.glmnet(X_matrix, Y, intercept = F, standardize = F)
+        lambda <- cvfit$lambda.min*1.2
+        beta1 <- as.vector(glmnet(X_matrix1, Y1, alpha = 1, lambda = lambda, intercept = F, standardize = F)$beta)
+        beta2 <- as.vector(glmnet(X_matrix2, Y2, alpha = 1, lambda = lambda, intercept = F, standardize = F)$beta)
+        index_beta1 = which(beta1 == 0)
+        index_beta2 = which(beta2 == 0)
+        
+        beta1_d = as.numeric(beta1 + 2/n*M1%*%t(X_matrix1)%*%(Y1 - X_matrix1 %*% beta1))
+        beta2_d = as.numeric(beta2 + 2/n*M2%*%t(X_matrix2)%*%(Y2 - X_matrix2 %*% beta2))
+        
+        sigma1 = sqrt(diag(M1%*%(t(X_matrix1)%*%diag(diag((Y1-X_matrix1%*%beta1)%*%t(Y1-X_matrix1%*%beta1)))%*%X_matrix1/(n/2))%*%t(M1)))
+        sigma2 = sqrt(diag(M2%*%(t(X_matrix2)%*%diag(diag((Y2-X_matrix2%*%beta2)%*%t(Y2-X_matrix2%*%beta2)))%*%X_matrix2/(n/2))%*%t(M2)))
+        
+        X1 = beta1_d/sigma1
+        X2 = beta2_d/sigma2
+        
+        S_tol = X1*X2
+        sh = get_conventional_threshold(S_tol,q_fdr, 1)
+        S_inclusion[ii,jj, which(S_tol > sh)] = S_inclusion[ii,jj, which(S_tol > sh)] + num_split^(-1)/max(length(which(S_tol > sh)),1)
+  
+        SPlus_tol = sign(X1*X2)*(abs(X1) + abs(X2))
+        sh = get_conventional_threshold(SPlus_tol,q_fdr, 1)
+        SPlus_inclusion[ii,jj, which(SPlus_tol > sh)] = SPlus_inclusion[ii,jj, which(SPlus_tol > sh)] + num_split^(-1)/max(length(which(SPlus_tol > sh)),1)
+  
+        Smin_tol = 2*sign(X1*X2)*apply(cbind(abs(X1), abs(X2)), 1, min)
+        sh = get_conventional_threshold(Smin_tol,q_fdr, 1)
+        Smin_inclusion[ii,jj, which(Smin_tol > sh)] = Smin_inclusion[ii,jj, which(Smin_tol > sh)] + num_split^(-1)/max(length(which(Smin_tol > sh)),1)
+  
+        label_DD = SAS(X1,X2,c=1,q_fdr=q_fdr)
+        DD_inclusion[ii,jj, label_DD] = DD_inclusion[ii,jj, label_DD] + num_split^(-1) / max(length(label_DD),1)
+      }
+    }
+  }
+  
+  for (ii in 1:length(parameter_proportion)) {
+    for (jj in 1:length(parameter_magnitude)) {
+        IDD_vec = DD_inclusion[ii,jj,]
+        MDD_result = MSAS(IDD_vec,label_X1X2,q_fdr)
+        IS_vec =  S_inclusion[ii,jj,]
+        MS_result = MSAS(IS_vec,label_X1X2,q_fdr)
+        ISPlus_vec = SPlus_inclusion[ii,jj,]
+        MSPlus_result = MSAS(ISPlus_vec,label_X1X2,q_fdr)
+        ISmin_vec =  Smin_inclusion[ii,jj,]
+        MSmin_result = MSAS(ISmin_vec,label_X1X2,q_fdr)
+        
+        DD_fdr_matrix[ii,jj] = MDD_result[1]
+        DD_power_matrix[ii,jj] = MDD_result[2]
+        S_fdr_matrix[ii,jj] = MS_result[1]
+        S_power_matrix[ii,jj] = MS_result[2]
+        SPlus_fdr_matrix[ii,jj] = MSPlus_result[1]
+        SPlus_power_matrix[ii,jj] = MSPlus_result[2]
+        Smin_fdr_matrix[ii,jj] = MSmin_result[1]
+        Smin_power_matrix[ii,jj] = MSmin_result[2]
+    }
+  }
+
+  
+  return(list(DD_fdr_matrix, DD_power_matrix, S_fdr_matrix, S_power_matrix, SPlus_fdr_matrix, SPlus_power_matrix, Smin_fdr_matrix, Smin_power_matrix))
+}
+
+for (i in 1:Rep_times) {
+  DD_fdr_m  = DD_fdr_m + Output_fdr_power[[i]][[1]]/Rep_times
+  DD_power_m  = DD_power_m + Output_fdr_power[[i]][[2]]/Rep_times
+  S_fdr_m  = S_fdr_m + Output_fdr_power[[i]][[3]]/Rep_times
+  S_power_m  = S_power_m + Output_fdr_power[[i]][[4]]/Rep_times
+  SPlus_fdr_m  = SPlus_fdr_m + Output_fdr_power[[i]][[5]]/Rep_times
+  SPlus_power_m  = SPlus_power_m + Output_fdr_power[[i]][[6]]/Rep_times
+  Smin_fdr_m  = Smin_fdr_m + Output_fdr_power[[i]][[7]]/Rep_times
+  Smin_power_m  = Smin_power_m + Output_fdr_power[[i]][[8]]/Rep_times
+}
+
+for (i in 1:length(parameter_magnitude)) {
+  output_table_fdr[,i] = as.vector(t(cbind(DD_fdr_m[,i],S_fdr_m[,i],SPlus_fdr_m[,i],Smin_fdr_m[,i])))
+  output_table_power[,i] = as.vector(t(cbind(DD_power_m[,i],S_power_m[,i],SPlus_power_m[,i],Smin_power_m[,i])))
+}
+
+
+appender <- function(string){TeX(paste("\\mu = $", string))}
+plot_data1 = data.frame(Power = output_table_power[,1], FDR = output_table_fdr[,1], `Threshold` = rep(c('SAS', 'DM', 'DSA', 'DSM'), length(parameter_proportion)), `delta` = rep(factor(parameter_proportion, level = as.character(parameter_proportion)), each=4))
+plot_data1$Threshold = factor(plot_data1$Threshold, levels = c('SAS','DM','DSA','DSM'),labels = c('SAS','DM','DSA','DSM'))
+colnames(plot_data1) = c('Power', 'FDR', 'Threshold', 'delta')
+plot_data1$Scenario = 0.25
+plot_data1$Threshold = factor(plot_data1$Threshold, levels = c('SAS','DM','DSA','DSM'),labels = c('SAS','DM','DSA','DSM'))
+
+Fig_power1 =  ggplot() +
+  geom_point(data = plot_data1, aes(x = delta, y= Power, color = Threshold, shape = Threshold), alpha =0.85) +
+  geom_line(data = plot_data1, aes(x = delta, y= Power, group = Threshold,color = Threshold, linetype = Threshold)) +
+  facet_wrap(~Scenario, labeller = as_labeller(appender, default = label_parsed))+
+  xlab(element_blank()) +
+  theme_bw() +
+  theme(legend.title=element_blank(),
+        legend.key = element_rect(colour = "transparent", fill = "transparent"),
+        legend.background= element_rect(colour = "transparent", fill = "transparent"))
+
+
+Fig_FDR1 =  ggplot() +
+  geom_point(data = plot_data1, aes(x = delta, y= FDR, color = Threshold, shape = Threshold), alpha =0.85) +
+  geom_line(data = plot_data1, aes(x = delta, y= FDR, group = Threshold,color = Threshold, linetype = Threshold)) +
+  ylim(c(0,0.3)) +
+  xlab(expression(delta)) +
+  theme_bw() +
+  geom_hline(yintercept = q_fdr, linetype='dashed', alpha=0.5) +
+  theme(legend.title=element_blank(),
+        legend.key = element_rect(colour = "transparent", fill = "transparent"),
+        legend.background= element_rect(colour = "transparent", fill = "transparent"))
+
+
+plot_data2 = data.frame(Power = output_table_power[,2], FDR = output_table_fdr[,2], `Threshold` = rep(c('SAS', 'DM', 'DSA', 'DSM'), length(parameter_proportion)), `delta` = rep(factor(parameter_proportion, level = as.character(parameter_proportion)), each=4))
+colnames(plot_data2) = c('Power', 'FDR', 'Threshold', 'delta')
+plot_data2$Scenario = 0.4
+plot_data2$Threshold = factor(plot_data2$Threshold, levels = c('SAS','DM','DSA','DSM'),labels = c('SAS','DM','DSA','DSM'))
+Fig_power2 =  ggplot() +
+  geom_point(data = plot_data2, aes(x = delta, y= Power, color = Threshold, shape = Threshold), alpha =0.85) +
+  geom_line(data = plot_data2, aes(x = delta, y= Power, group = Threshold,color = Threshold, linetype = Threshold)) +
+  facet_wrap(~Scenario, labeller = as_labeller(appender, default = label_parsed))+
+  ylab(element_blank()) +
+  xlab(element_blank()) +
+  theme_bw() +
+  theme(legend.title=element_blank(),
+        legend.key = element_rect(colour = "transparent", fill = "transparent"),
+        legend.background= element_rect(colour = "transparent", fill = "transparent"))
+
+
+Fig_FDR2 =  ggplot() +
+  geom_point(data = plot_data2, aes(x = delta, y= FDR, color = Threshold, shape = Threshold), alpha =0.85) +
+  geom_line(data = plot_data2, aes(x = delta, y= FDR, group = Threshold,color = Threshold, linetype = Threshold)) +
+  ylim(c(0,0.3)) +
+  ylab(element_blank()) +
+  xlab(expression(delta)) +
+  theme_bw() +
+  geom_hline(yintercept = q_fdr, linetype='dashed', alpha=0.5) +
+  theme(legend.title=element_blank(),
+        legend.key = element_rect(colour = "transparent", fill = "transparent"),
+        legend.background= element_rect(colour = "transparent", fill = "transparent"))
+
+
+plot_data3 = data.frame(Power = output_table_power[,3], FDR = output_table_fdr[,3], `Threshold` = rep(c('SAS', 'DM', 'DSA', 'DSM'), length(parameter_proportion)), `delta` = rep(factor(parameter_proportion, level = as.character(parameter_proportion)), each=4))
+
+colnames(plot_data3) = c('Power', 'FDR', 'Threshold', 'delta')
+plot_data3$Scenario = 0.55
+plot_data3$Threshold = factor(plot_data3$Threshold, levels = c('SAS','DM','DSA','DSM'),labels = c('SAS','DM','DSA','DSM'))
+Fig_power3 =  ggplot() +
+  geom_point(data = plot_data3, aes(x = delta, y= Power, color = Threshold, shape = Threshold), alpha =0.85) +
+  geom_line(data = plot_data3, aes(x = delta, y= Power, group = Threshold,color = Threshold, linetype = Threshold)) +
+  facet_wrap(~Scenario, labeller = as_labeller(appender, default = label_parsed))+
+  xlab(element_blank()) +
+  ylab(element_blank()) +
+  theme_bw() +
+  theme(legend.title=element_blank(),
+        legend.key = element_rect(colour = "transparent", fill = "transparent"),
+        legend.background= element_rect(colour = "transparent", fill = "transparent"))
+
+
+Fig_FDR3 =  ggplot() +
+  geom_point(data = plot_data3, aes(x = delta, y= FDR, color = Threshold, shape = Threshold), alpha =0.85) +
+  geom_line(data = plot_data3, aes(x = delta, y= FDR, group = Threshold,color = Threshold, linetype = Threshold)) +
+  ylim(c(0,0.3)) +
+  xlab(expression(delta)) +
+  ylab(element_blank()) +
+  theme_bw() +
+  geom_hline(yintercept = q_fdr, linetype='dashed', alpha=0.5) +
+  theme(legend.title=element_blank(),
+        legend.key = element_rect(colour = "transparent", fill = "transparent"),
+        legend.background= element_rect(colour = "transparent", fill = "transparent"))
+
+Fig1 = Fig_power1 + Fig_power2 + Fig_power3  + Fig_FDR1 + Fig_FDR2 +  Fig_FDR3 + plot_layout(ncol = 3, guides = 'collect')
+ggsave('DerandomizedDS_5_1.jpg',Fig1, width = 9, height = 5.25, dpi = 400)
+stopImplicitCluster()
+stopCluster(cl)
+```
+
+```{r, fig.width = 9, fig.height = 5.25}
+Fig1
+```

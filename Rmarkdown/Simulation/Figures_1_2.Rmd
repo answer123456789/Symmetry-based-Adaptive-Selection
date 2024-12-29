@@ -1,0 +1,224 @@
+---
+title: "Figures 1-2"
+output: html_document
+date: '2024-08-12'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+```
+
+```{r, results='hide'}
+path = dirname(rstudioapi::getActiveDocumentContext()$path)
+setwd(path)
+source('Functions.R')
+library(MASS) 
+library(ggplot2)
+library(glmnet)
+library(patchwork)
+RhpcBLASctl::blas_set_num_threads(1)
+
+n = 600
+d_X = 1500
+d_h1 = 50
+d_h0 = d_X-d_h1
+q_fdr = 0.1
+seeds = 111 
+label_X1X2 = c(rep('Null', d_h0), rep('Non-null', d_h1))
+set.seed(seeds)
+coef_X = matrix(c(rep(0,d_h0), rep(0.2,d_h1)), d_X)
+X_matrix = matrix(0, n, d_X)
+Sigma = diag(1,d_X,d_X)
+for (i in 1:d_X) {
+  for (j in 1:d_X) {
+    Sigma[i,j] = 0.0^abs(i-j)
+  }
+}
+
+X_matrix = mvrnorm(n, runif(d_X,-1,1), Sigma)
+Y = X_matrix %*% coef_X + rnorm(n,0,1)
+Y1 = Y[1:(n/2),]
+Y2 = Y[(1+(n/2)):n,]
+X_matrix1 = X_matrix[1:(n/2),]
+X_matrix2 = X_matrix[(1+(n/2)):n,]
+M1 = get_M(X_matrix1)
+M2 = get_M(X_matrix2)
+
+cvfit <- cv.glmnet(X_matrix, Y, intercept = F, standardize = F)
+lambda <- cvfit$lambda.min
+beta1 <- as.vector(glmnet(X_matrix1, Y1, alpha = 1, lambda = lambda, intercept = F, standardize = F)$beta)
+beta2 <- as.vector(glmnet(X_matrix2, Y2, alpha = 1, lambda = lambda, intercept = F, standardize = F)$beta)
+index_beta1 = which(beta1 == 0)
+index_beta2 = which(beta2 == 0)
+
+beta1_d = as.numeric(beta1 + 2/n*M1%*%t(X_matrix1)%*%(Y1 - X_matrix1 %*% beta1))
+beta2_d = as.numeric(beta2 + 2/n*M2%*%t(X_matrix2)%*%(Y2 - X_matrix2 %*% beta2))
+
+sigma1 = sqrt(diag(M1%*%(t(X_matrix1)%*%diag(diag((Y1-X_matrix1%*%beta1)%*%t(Y1-X_matrix1%*%beta1)))%*%X_matrix1/(n/2))%*%t(M1)))
+sigma2 = sqrt(diag(M2%*%(t(X_matrix2)%*%diag(diag((Y2-X_matrix2%*%beta2)%*%t(Y2-X_matrix2%*%beta2)))%*%X_matrix2/(n/2))%*%t(M2)))
+
+X1 = beta1_d/sigma1
+X2 = beta2_d/sigma2
+
+plot_lim = 0.8
+
+get_conventional_threshold <- function(S, q_fdr){
+  t = sort(abs(S))
+  Ta = sapply(t,function(x){(length(S[S<(-x)]))/max(1,length(S[S>x]))})
+  sh = min(t[which(Ta<=q_fdr)]) 
+  return(sh)
+}
+S_tol = sign(X1*X2)*(abs(X1) + abs(X2))
+
+sh = get_conventional_threshold(S_tol,q_fdr)
+
+get_conventional_threshold1 <- function(S, q_fdr){
+  t = sort(abs(S))
+  Ta = sapply(t,function(x){0.5*(length(S[S<(-x)]))/max(1,length(intersect(which(S>x), which(X1 > 0))))})
+  sh = min(t[which(Ta<=q_fdr)]) 
+  return(sh)
+}
+
+sh1 = get_conventional_threshold1(S_tol,q_fdr)
+index11 = union(which((X1 > 0)), which(X2 > 0))
+S_tol1 = S_tol[index11]
+label1_X1X2  = label_X1X2[index11]
+
+
+tt11=sh
+scat_data = data.frame(X1, X2, 'W' = sign(X1*X2)*(abs(X1)+abs(X2)), `Label` = c(rep('Null', d_h0), rep('Non-null', d_X-d_h0)))
+xxx111 = seq(0,sh,plot_lim/d_X)
+xxx111 = xxx111[c(2:(d_X+1))]
+tt2 = sh1
+xx222 = seq(0,sh1,plot_lim/d_X)
+xx222 = xx222[c(2:(d_X+1))]
+
+scat_plot2 <- ggplot(scat_data) +
+  geom_point(aes(X1 ,X2,fill=`Label`,shape = `Label`, alpha=`Label`), size =1.5) +
+  theme_bw() +
+  scale_alpha_discrete(range = c(0.9, 0.5)) + 
+  xlab(expression(italic(t^(1))))+
+  ylab(expression(italic(t^(2))))+
+  ylim(c(-plot_lim,plot_lim)) +
+  xlim(c(-plot_lim,plot_lim)) + 
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.7) +
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.7) +
+  geom_line(aes(xxx111, tt11-xxx111), linewidth = 0.8,alpha = 0.9, color = '#a3cd5b') +
+  geom_line(aes(xx222, tt2-xx222), linewidth = 0.8, alpha = 0.7, color = '#FF582A',linetype='dashed') +
+  geom_line(aes(-xxx111, -tt11+xxx111), linewidth = 0.8,alpha = 0.9, color = '#a3cd5b') +
+  scale_fill_manual(values = c("Non-null"="#a3cd5b",
+                               "Null"="#8ea0cc")) +
+  scale_shape_manual(values = c(21,22))+
+  labs(caption="(b)") +
+  theme(legend.title=element_blank(),
+        base_family = "serif",
+        plot.subtitle = element_text(family = "serif", size = 10, face = "bold", hjust = 0.5),
+        plot.caption = element_text(hjust=0.5, size=rel(1.1)),
+        legend.background = element_rect(fill = NA)) #+
+
+
+set.seed(seeds)
+coef_X = matrix(c(rep(0,d_h0), rep(0.2,d_h1/2), rep(-0.2,d_h1/2)), d_X)
+X_matrix = mvrnorm(n, runif(d_X,-1,1), Sigma)
+Y = X_matrix %*% coef_X + rnorm(n,0,1)
+Y1 = Y[1:(n/2),]
+Y2 = Y[(1+(n/2)):n,]
+X_matrix1 = X_matrix[1:(n/2),]
+X_matrix2 = X_matrix[(1+(n/2)):n,]
+M1 = get_M(X_matrix1)
+M2 = get_M(X_matrix2)
+
+cvfit <- cv.glmnet(X_matrix, Y, intercept = F, standardize = F)
+lambda <- cvfit$lambda.min
+beta1 <- as.vector(glmnet(X_matrix1, Y1, alpha = 1, lambda = lambda, intercept = F, standardize = F)$beta)
+beta2 <- as.vector(glmnet(X_matrix2, Y2, alpha = 1, lambda = lambda, intercept = F, standardize = F)$beta)
+index_beta1 = which(beta1 == 0)
+index_beta2 = which(beta2 == 0)
+
+beta1_d = as.numeric(beta1 + 2/n*M1%*%t(X_matrix1)%*%(Y1 - X_matrix1 %*% beta1))
+beta2_d = as.numeric(beta2 + 2/n*M2%*%t(X_matrix2)%*%(Y2 - X_matrix2 %*% beta2))
+
+sigma1 = sqrt(diag(M1%*%(t(X_matrix1)%*%diag(diag((Y1-X_matrix1%*%beta1)%*%t(Y1-X_matrix1%*%beta1)))%*%X_matrix1/(n/2))%*%t(M1)))
+sigma2 = sqrt(diag(M2%*%(t(X_matrix2)%*%diag(diag((Y2-X_matrix2%*%beta2)%*%t(Y2-X_matrix2%*%beta2)))%*%X_matrix2/(n/2))%*%t(M2)))
+
+X1 = beta1_d/sigma1
+X2 = beta2_d/sigma2
+
+S_tol = sign(X1*X2)*(abs(X1) + abs(X2))
+sh = get_conventional_threshold(S_tol,q_fdr)
+
+
+tt1=sh
+scat_data1 = data.frame(X1, X2, 'W' = sign(X1*X2)*(abs(X1)+abs(X2)), `Label` = c(rep('Null', d_h0), rep('Non-null', d_X-d_h0)))
+xx111 = seq(0,sh,plot_lim/d_X)
+xx111 = xx111[c(2:(d_X+1))]
+xx222 = seq(0,sh1,plot_lim/d_X)
+xx222 = xx222[c(2:(d_X+1))]
+
+scat_plot1 <- ggplot(scat_data1) +
+  geom_point(aes(X1 ,X2,fill=`Label`,shape = `Label`, alpha = `Label`), size =1.5) +
+  theme_bw() +
+  scale_alpha_discrete(range = c(0.9, 0.5)) + 
+  xlab(expression(italic(t^(1))))+
+  ylab(expression(italic(t^(2))))+
+  ylim(c(-plot_lim,plot_lim)) +
+  xlim(c(-plot_lim,plot_lim)) + 
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.7) +
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.7) +
+  geom_line(aes(xx111, tt1-xx111), linewidth = 0.8, alpha = 0.9, color = '#a3cd5b') +
+  geom_line(aes(-xx111, -tt1+xx111), linewidth = 0.8, alpha = 0.9, color = '#a3cd5b') +
+  scale_fill_manual(values = c("Non-null"="#a3cd5b",
+                               "Null"="#8ea0cc")) +
+  scale_shape_manual(values = c(21,22))+
+  labs(caption="(a)") +
+  theme(legend.title=element_blank(),
+        base_family = "serif",
+        plot.subtitle = element_text(family = "serif", size = 10, face = "bold", hjust = 0.5),
+        legend.position = 'none',
+        plot.caption = element_text(hjust=0.5, size=rel(1.1)),
+        legend.background = element_rect(fill = NA)) #+
+
+Fig = scat_plot1  + scat_plot2 +  plot_layout(ncol = 2)
+ggsave('Figure_1.jpg',Fig, width = 8, height =3.8, dpi = 600)
+
+
+
+
+rownames(scat_data1) = c(1:nrow(scat_data1))
+scat_data_filp = scat_data1[which(scat_data1[,3]<0),]
+scat_data_filp_ =  scat_data1[scat_data1[,3]<0,]
+scat_data_filp_[,c('X1','W')] = -scat_data_filp_[,c('X1','W')]
+scat_data_filp = rbind(scat_data_filp,scat_data_filp_)
+
+scat_plot3 <- ggplot(scat_data_filp) +
+  geom_point(aes(X1,X2,fill=`Label`,shape = Label,alpha = Label), size =1.5)+
+  theme_bw() +
+  scale_alpha_discrete(range = c(0.9, 0.5)) + 
+  xlab(expression(italic(t^(1))))+
+  ylab(expression(italic(t^(2))))+
+  ylim(c(-plot_lim,plot_lim)) +
+  xlim(c(-plot_lim,plot_lim)) + 
+  # scale_shape_manual(values = c(21)) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.7) +
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.7) +
+  scale_fill_manual(values = c("Non-null"="#a3cd5b",
+                               "Null"="#8ea0cc")) +
+  scale_shape_manual(values = c(21,22))+
+  theme(legend.title=element_blank(),
+        plot.subtitle = element_text(family = "serif", size = 10, face = "bold", hjust = 0.5),
+        # legend.position = 'none',
+        # legend.key = element_rect(colour = "transparent", fill = "transparent"), 
+        # legend.box.background = element_rect(colour = 'transparent'),
+        plot.caption = element_text(hjust=0.5, size=rel(1.1)),
+        legend.background = element_rect(fill = NA)) #+
+
+
+ggsave('Figure_2.jpg',scat_plot3, width = 4.6, height =3.4, dpi = 600)
+```
+
+```{r, fig.width = 8.4, fig.height =3.8}
+Fig
+```
+```{r, fig.width = 4.6, fig.height =3.4}
+scat_plot3
+```

@@ -1,0 +1,422 @@
+---
+title: "HIV Data Analysis (Bar Plot)"
+output: html_document
+date: "2024-03-11"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r, results = 'hide'}
+path = dirname(rstudioapi::getActiveDocumentContext()$path)
+setwd(path)
+library(MASS) 
+library(ggplot2)
+library(glmnet)
+library(knockoff)
+library(doSNOW)
+library(foreach)
+library(doParallel)
+source('Functions.R')
+cl <- makeCluster(17, outfile = 'Realdata_outs.out')
+registerDoParallel(cl)
+registerDoSNOW(cl)
+clusterEvalQ(cl = cl, RhpcBLASctl::blas_set_num_threads(1))
+
+Rep_times = 50
+fdr_target = 0.1
+drug_class = 'PI' # Possible drug types are 'PI', 'NRTI', and 'NNRTI'. In the paper we restrict to PI.
+seeds = 99 
+  
+### Cleaning and Fetching the data
+base_url = 'https://hivdb.stanford.edu/_wrapper/pages/published_analysis/genophenoPNAS2006'
+gene_url = paste(base_url, 'DATA', paste0(drug_class, '_DATA.txt'), sep='/')
+tsm_url = paste(base_url, 'MUTATIONLISTS', 'NP_TSM', drug_class, sep='/')
+gene_df = read.delim(gene_url, na.string = c('NA', ''), stringsAsFactors = FALSE)
+tsm_df = read.delim(tsm_url, header = FALSE, stringsAsFactors = FALSE)
+names(tsm_df) = c('Position', 'Mutations')
+
+### Removing the rows with error flags or nonstandard mutation codes
+pos_start = which(names(gene_df) == 'P1')
+pos_cols = seq.int(pos_start, ncol(gene_df))
+valid_rows = grepl_rows('^(\\.|-|[A-Zid]+)$', gene_df[,pos_cols])
+gene_df = gene_df[valid_rows,]
+
+### Prepare the design matrix and response variable.
+# Flatten a matrix to a vector with names from concatenating row/column names
+# Construct preliminary design matrix.
+muts = c(LETTERS, 'i', 'd')
+X = outer(muts, as.matrix(gene_df[,pos_cols]), Vectorize(grepl))
+X = aperm(X, c(2,3,1))
+dimnames(X)[[3]] <- muts
+X = t(apply(X, 1, flatten_matrix))
+mode(X) <- 'numeric'
+
+# Remove any mutation/position pairs that never appear in the data.
+X = X[,colSums(X) != 0]
+X_ = X
+
+# Extract response matrix.
+Y11 = gene_df[,4:(pos_start-1)]
+Y = gene_df[,4:(pos_start-1)]
+
+output_table_dis = output_table_dis_der = data.frame(matrix(ncol = 8, nrow = 0))
+
+for (yy in 1:length(Y11)) {
+  # Experiment
+  y = log(Y11[,yy])
+  missing = is.na(y)
+  y = y[!missing]
+  X = X_[!missing,]
+  X = X[,colSums(X) >= 3]
+  X = X[,colSums(abs(cor(X)-1) < 1e-4) == 1]
+  
+  AdpK_td_list  = list(); AdpK_fd_list  = list()
+  Kminus_td_list  = list(); Kminus_fd_list  = list()
+  Ksquare_td_list  = list(); Ksquare_fd_list  = list()
+  Kmax_td_list  = list(); Kmax_fd_list  = list()
+  
+  AdpK_inclusion0 = Kminus_inclusion0 = Ksquare_inclusion0 = Kmax_inclusion0 = array(0,dim = c(1, ncol(X)))
+  Output_dis <- foreach (time = 1:Rep_times, .packages =c('MASS', 'knockoff', 'glmnet')) %dopar%  {
+    source('Functions.R')
+    set.seed(time+seeds)
+    print(paste("Rep time:", time))
+    X_matrix = X
+    AdpK_inclusion = Kminus_inclusion = Ksquare_inclusion = Kmax_inclusion = array(0,dim = c(1, ncol(X_matrix)))
+    index = c()
+    ii = 0
+    for (i in colnames(X_matrix)) {
+      ii = ii + 1
+      if(get_position(i) %in% tsm_df$Position){
+        index = c(index, ii)
+      }
+    }
+    n=length(y)
+    Y = as.matrix(y)
+    X_knockoffs = create.second_order(X_matrix,  method='equi')
+    X_matrix = cbind(X_matrix, X_knockoffs)
+    cvfit <- cv.glmnet(X_matrix, Y, intercept = F)
+    lambda <- cvfit$lambda.min
+    beta1 <- as.vector(glmnet(X_matrix, Y, alpha = 1, lambda = lambda, intercept = F)$beta)
+    index_beta1 = which(beta1 == 0)
+    ## Get the debiased Lasso estimator
+    M1 = get_M(X_matrix)
+    beta1_d = as.numeric(beta1 + 1/n*M1%*%t(X_matrix)%*%(Y - X_matrix %*% beta1))
+    ## Get the variance for the debiased Lasso estimator (up to a scaling factor)
+    sigma1 = sqrt(diag(M1%*%(t(X_matrix)%*%diag(diag((Y-X_matrix%*%beta1)%*%t(Y-X_matrix%*%beta1)))%*%X_matrix/(n/1))%*%t(M1)))
+    tmp = beta1_d/sigma1
+    d_X = ncol(X_matrix)/2
+    X1 = tmp[1:(d_X)] - tmp[(d_X+1):(d_X*2)]
+    X2 = tmp[1:(d_X)] + tmp[(d_X+1):(d_X*2)]
+  
+    
+    selected = SAS(X1,X2,c=1,c0=1,c1=1,q_fdr=fdr_target)
+    selected_AdpK = colnames(X)[selected]
+    AdpK = dr(selected_AdpK)
+    AdpK_inclusion[selected] = 1/max(length(selected),1)/Rep_times
+    
+    Sminus_tol = 2*sign(X1*X2)*apply(cbind(abs(X1), abs(X2)), 1, min)
+    sh = get_conventional_threshold(Sminus_tol,fdr_target,1)
+    selected_Kminus = colnames(X)[which(Sminus_tol >= sh)]
+    Kminus = dr(selected_Kminus)
+    Kminus_inclusion[which(Sminus_tol >= sh)] = 1/max(length(which(Sminus_tol >= sh)),1)/Rep_times
+    
+    SSquare_tol = X1*X2
+    sh = get_conventional_threshold(SSquare_tol,fdr_target,1)
+    selected_Ksquare = colnames(X)[which(SSquare_tol >= sh)]
+    Ksquare = dr(selected_Ksquare)
+    Ksquare_inclusion[which(SSquare_tol >= sh)] = 1/max(length(which(SSquare_tol >= sh)),1)/Rep_times
+    
+    Smax_tol = sign(X1*X2)*(abs(X1) + abs(X2))
+    sh = get_conventional_threshold(Smax_tol,fdr_target,1)
+    selected_Kmax = colnames(X)[which(Smax_tol >= sh)]
+    Kmax = dr(selected_Kmax)
+    Kmax_inclusion[which(Smax_tol >= sh)] = 1/max(length(which(Smax_tol >= sh)),1)/Rep_times
+
+    return(list(AdpK[[1]], AdpK[[2]], Kminus[[1]], Kminus[[2]], Ksquare[[1]], Ksquare[[2]], Kmax[[1]], Kmax[[2]],AdpK_inclusion, Kminus_inclusion, Ksquare_inclusion, Kmax_inclusion))
+  }
+  
+  for (i in 1:Rep_times) {
+    AdpK_td_list[i]  = Output_dis[[i]][[1]]
+    AdpK_fd_list[i]  = Output_dis[[i]][[2]]
+    Kminus_td_list[i]  = Output_dis[[i]][[3]]
+    Kminus_fd_list[i]  = Output_dis[[i]][[4]]
+    Ksquare_td_list[i]  = Output_dis[[i]][[5]]
+    Ksquare_fd_list[i]  = Output_dis[[i]][[6]]
+    Kmax_td_list[i]  = Output_dis[[i]][[7]]
+    Kmax_fd_list[i]  = Output_dis[[i]][[8]]
+    AdpK_inclusion0 = AdpK_inclusion0 + Output_dis[[i]][[9]]
+    Kminus_inclusion0 = Kminus_inclusion0 + Output_dis[[i]][[10]]
+    Ksquare_inclusion0 = Ksquare_inclusion0 + Output_dis[[i]][[11]]
+    Kmax_inclusion0 = Kmax_inclusion0 + Output_dis[[i]][[12]]
+  }
+  AdpK_td_list  = unlist(AdpK_td_list); AdpK_fd_list  = unlist(AdpK_fd_list)
+  Kminus_td_list  = unlist(Kminus_td_list); Kminus_fd_list  = unlist(Kminus_fd_list)
+  Ksquare_td_list  = unlist(Ksquare_td_list); Ksquare_fd_list  = unlist(Ksquare_fd_list)
+  Kmax_td_list  = unlist(Kmax_td_list); Kmax_fd_list  = unlist(Kmax_fd_list)
+  
+  output = data.frame(AdpK_td_list, AdpK_fd_list,
+                      Kminus_td_list, Kminus_fd_list,
+                      Ksquare_td_list, Ksquare_fd_list,
+                      Kmax_td_list, Kmax_fd_list)
+  mean_dis = apply(output, 2, mean)
+  output_table_dis = rbind(output_table_dis, mean_dis)
+  
+  AdpK = MSAS_HIV(AdpK_inclusion0, colnames(X), fdr_target)
+  Kminus = MSAS_HIV(Kminus_inclusion0, colnames(X), fdr_target)
+  Ksquare = MSAS_HIV(Ksquare_inclusion0, colnames(X), fdr_target)
+  Kmax = MSAS_HIV(Kmax_inclusion0, colnames(X), fdr_target)
+  
+  output_table_dis_der = rbind(output_table_dis_der, c(AdpK[[1]], AdpK[[2]], Kminus[[1]], Kminus[[2]], Ksquare[[1]], Ksquare[[2]], Kmax[[1]], Kmax[[2]]))
+}
+
+Discovery = factor(rep(c('In TSM list', 'Not in TSM list'), times = length(output_table_dis)/2*length(Y)),
+                   levels = c('Not in TSM list', 'In TSM list'))
+Methods = factor(rep(c('SAS', 'SAS','KLCD','KLCD', 
+                       'KSCD', 'KSCD', 'KLSM', 'KLSM'), times = length(Y)),
+                 levels = c('SAS','KLCD', 'KSCD', 'KLSM'))
+Drug = rep(paste('Resistance to',colnames(Y)), each = ncol(output_table_dis))
+
+Values = as.vector(t(as.matrix(output_table_dis)))
+plot_data = data.frame(Discovery, Methods, Values, Drug)
+plot_data = plot_data[plot_data$Methods %in% c('SAS','KLCD', 'KSCD', 'KLSM'),]
+data_text<-data.frame(label=c("n=767  p=201","n=328  p=147","n=825  p=206","n=515  p=184",
+                              "n=842  p=207","n=793  p=205","n=824  p=206"),
+                      Drug=paste('Resistance to',colnames(Y)),
+                      x=rep(2.5, 7),
+                      y=rep(37, 7))
+
+Fig1 = ggplot(plot_data, aes(x=Methods, y=Values, fill=Discovery)) + 
+  geom_bar(stat="identity",position = "stack", alpha = 0.95, color = 'white') + 
+  geom_text(aes(label=round(Values,2)),position = position_stack(vjust = 0.5),size=2) +
+  ylab('Numbers of the discovered mutations') + 
+  xlab('') + 
+  ylim(c(0,38.5))+
+  scale_fill_manual(values = c("In TSM list"="#a3cd5b",
+                               "Not in TSM list"="#8ea0cc")) +
+  theme_bw() + 
+  facet_wrap(~Drug, ncol=4, scales = "free_x") +
+  geom_text(data=data_text,mapping=aes(x=x,y=y,label=label,fill=NULL),size=3)+
+  theme(axis.text.x = element_text(angle=60, hjust = 1),
+        legend.position = c(0.88,0.2),
+        legend.title = element_blank())
+ggsave('HIV_q01_1.jpg',Fig1, width = 6, height = 5, dpi = 600)
+
+Values = as.vector(t(as.matrix(output_table_dis_der)))
+plot_data = data.frame(Discovery, Methods, Values, Drug)
+plot_data = plot_data[plot_data$Methods %in% c('SAS','KLCD', 'KSCD', 'KLSM'),]
+data_text<-data.frame(label=c("n=767  p=201","n=328  p=147","n=825  p=206","n=515  p=184",
+                              "n=842  p=207","n=793  p=205","n=824  p=206"),
+                      Drug=paste('Resistance to',colnames(Y)),
+                      x=rep(2.5, 7),
+                      y=rep(37, 7))
+
+Fig1_DER = ggplot(plot_data, aes(x=Methods, y=Values, fill=Discovery)) + 
+  geom_bar(stat="identity",position = "stack", alpha = 0.95, color = 'white') + 
+  geom_text(aes(label=round(Values,2)),position = position_stack(vjust = 0.5),size=2) +
+  ylab('Numbers of the discovered mutations') + 
+  xlab('') + 
+  ylim(c(0,38.5))+
+  scale_fill_manual(values = c("In TSM list"="#a3cd5b",
+                               "Not in TSM list"="#8ea0cc")) +
+  theme_bw() + 
+  facet_wrap(~Drug, ncol=4, scales = "free_x") +
+  geom_text(data=data_text,mapping=aes(x=x,y=y,label=label,fill=NULL),size=3)+
+  theme(axis.text.x = element_text(angle=60, hjust = 1),
+        legend.position = c(0.88,0.2),
+        legend.title = element_blank())
+ggsave('DER_HIV_q01_1.jpg',Fig1_DER, width = 6, height = 5, dpi = 600)
+```
+
+```{r, fig.width = 6, fig.height = 5}
+Fig1
+```
+
+```{r, fig.width = 6, fig.height = 5}
+Fig1_DER
+```
+
+
+```{r, results = 'hide'}
+fdr_target = 0.2
+
+output_table_dis = output_table_dis_der = data.frame(matrix(ncol = 8, nrow = 0))
+
+for (yy in 1:length(Y11)) {
+  # Experiment
+  y = log(Y11[,yy])
+  missing = is.na(y)
+  y = y[!missing]
+  X = X_[!missing,]
+  X = X[,colSums(X) >= 3]
+  X = X[,colSums(abs(cor(X)-1) < 1e-4) == 1]
+  
+  AdpK_td_list  = list(); AdpK_fd_list  = list()
+  Kminus_td_list  = list(); Kminus_fd_list  = list()
+  Ksquare_td_list  = list(); Ksquare_fd_list  = list()
+  Kmax_td_list  = list(); Kmax_fd_list  = list()
+  
+  AdpK_inclusion0 = Kminus_inclusion0 = Ksquare_inclusion0 = Kmax_inclusion0 = array(0,dim = c(1, ncol(X)))
+  Output_dis <- foreach (time = 1:Rep_times, .packages =c('MASS', 'knockoff', 'glmnet')) %dopar%  {
+    source('Functions.R')
+    set.seed(time+seeds)
+    print(paste("Rep time:", time))
+    X_matrix = X
+    AdpK_inclusion = Kminus_inclusion = Ksquare_inclusion = Kmax_inclusion = array(0,dim = c(1, ncol(X_matrix)))
+    index = c()
+    ii = 0
+    for (i in colnames(X_matrix)) {
+      ii = ii + 1
+      if(get_position(i) %in% tsm_df$Position){
+        index = c(index, ii)
+      }
+    }
+    n=length(y)
+    Y = as.matrix(y)
+    X_knockoffs = create.second_order(X_matrix,  method='equi')
+    X_matrix = cbind(X_matrix, X_knockoffs)
+    cvfit <- cv.glmnet(X_matrix, Y, intercept = F)
+    lambda <- cvfit$lambda.min
+    beta1 <- as.vector(glmnet(X_matrix, Y, alpha = 1, lambda = lambda, intercept = F)$beta)
+    index_beta1 = which(beta1 == 0)
+    ## Get the debiased Lasso estimator
+    M1 = get_M(X_matrix)
+    beta1_d = as.numeric(beta1 + 1/n*M1%*%t(X_matrix)%*%(Y - X_matrix %*% beta1))
+    ## Get the variance for the debiased Lasso estimator (up to a scaling factor)
+    sigma1 = sqrt(diag(M1%*%(t(X_matrix)%*%diag(diag((Y-X_matrix%*%beta1)%*%t(Y-X_matrix%*%beta1)))%*%X_matrix/(n/1))%*%t(M1)))
+    tmp = beta1_d/sigma1
+    d_X = ncol(X_matrix)/2
+    X1 = tmp[1:(d_X)] - tmp[(d_X+1):(d_X*2)]
+    X2 = tmp[1:(d_X)] + tmp[(d_X+1):(d_X*2)]
+  
+    
+    selected = SAS(X1,X2,c=1,c0=1,c1=1,q_fdr=fdr_target)
+    selected_AdpK = colnames(X)[selected]
+    AdpK = dr(selected_AdpK)
+    AdpK_inclusion[selected] = 1/max(length(selected),1)/Rep_times
+    
+    Sminus_tol = 2*sign(X1*X2)*apply(cbind(abs(X1), abs(X2)), 1, min)
+    sh = get_conventional_threshold(Sminus_tol,fdr_target,1)
+    selected_Kminus = colnames(X)[which(Sminus_tol >= sh)]
+    Kminus = dr(selected_Kminus)
+    Kminus_inclusion[which(Sminus_tol >= sh)] = 1/max(length(which(Sminus_tol >= sh)),1)/Rep_times
+    
+    SSquare_tol = X1*X2
+    sh = get_conventional_threshold(SSquare_tol,fdr_target,1)
+    selected_Ksquare = colnames(X)[which(SSquare_tol >= sh)]
+    Ksquare = dr(selected_Ksquare)
+    Ksquare_inclusion[which(SSquare_tol >= sh)] = 1/max(length(which(SSquare_tol >= sh)),1)/Rep_times
+    
+    Smax_tol = sign(X1*X2)*(abs(X1) + abs(X2))
+    sh = get_conventional_threshold(Smax_tol,fdr_target,1)
+    selected_Kmax = colnames(X)[which(Smax_tol >= sh)]
+    Kmax = dr(selected_Kmax)
+    Kmax_inclusion[which(Smax_tol >= sh)] = 1/max(length(which(Smax_tol >= sh)),1)/Rep_times
+
+    return(list(AdpK[[1]], AdpK[[2]], Kminus[[1]], Kminus[[2]], Ksquare[[1]], Ksquare[[2]], Kmax[[1]], Kmax[[2]],AdpK_inclusion, Kminus_inclusion, Ksquare_inclusion, Kmax_inclusion))
+  }
+  
+  for (i in 1:Rep_times) {
+    AdpK_td_list[i]  = Output_dis[[i]][[1]]
+    AdpK_fd_list[i]  = Output_dis[[i]][[2]]
+    Kminus_td_list[i]  = Output_dis[[i]][[3]]
+    Kminus_fd_list[i]  = Output_dis[[i]][[4]]
+    Ksquare_td_list[i]  = Output_dis[[i]][[5]]
+    Ksquare_fd_list[i]  = Output_dis[[i]][[6]]
+    Kmax_td_list[i]  = Output_dis[[i]][[7]]
+    Kmax_fd_list[i]  = Output_dis[[i]][[8]]
+    AdpK_inclusion0 = AdpK_inclusion0 + Output_dis[[i]][[9]]
+    Kminus_inclusion0 = Kminus_inclusion0 + Output_dis[[i]][[10]]
+    Ksquare_inclusion0 = Ksquare_inclusion0 + Output_dis[[i]][[11]]
+    Kmax_inclusion0 = Kmax_inclusion0 + Output_dis[[i]][[12]]
+  }
+  AdpK_td_list  = unlist(AdpK_td_list); AdpK_fd_list  = unlist(AdpK_fd_list)
+  Kminus_td_list  = unlist(Kminus_td_list); Kminus_fd_list  = unlist(Kminus_fd_list)
+  Ksquare_td_list  = unlist(Ksquare_td_list); Ksquare_fd_list  = unlist(Ksquare_fd_list)
+  Kmax_td_list  = unlist(Kmax_td_list); Kmax_fd_list  = unlist(Kmax_fd_list)
+  
+  output = data.frame(AdpK_td_list, AdpK_fd_list,
+                      Kminus_td_list, Kminus_fd_list,
+                      Ksquare_td_list, Ksquare_fd_list,
+                      Kmax_td_list, Kmax_fd_list)
+  mean_dis = apply(output, 2, mean)
+  output_table_dis = rbind(output_table_dis, mean_dis)
+  
+  AdpK = MSAS_HIV(AdpK_inclusion0, colnames(X), fdr_target)
+  Kminus = MSAS_HIV(Kminus_inclusion0, colnames(X), fdr_target)
+  Ksquare = MSAS_HIV(Ksquare_inclusion0, colnames(X), fdr_target)
+  Kmax = MSAS_HIV(Kmax_inclusion0, colnames(X), fdr_target)
+  
+  output_table_dis_der = rbind(output_table_dis_der, c(AdpK[[1]], AdpK[[2]], Kminus[[1]], Kminus[[2]], Ksquare[[1]], Ksquare[[2]], Kmax[[1]], Kmax[[2]]))
+}
+
+Discovery = factor(rep(c('In TSM list', 'Not in TSM list'), times = length(output_table_dis)/2*length(Y)),
+                   levels = c('Not in TSM list', 'In TSM list'))
+Methods = factor(rep(c('SAS', 'SAS','KLCD','KLCD', 
+                       'KSCD', 'KSCD', 'KLSM', 'KLSM'), times = length(Y)),
+                 levels = c('SAS','KLCD', 'KSCD', 'KLSM'))
+Drug = rep(paste('Resistance to',colnames(Y)), each = ncol(output_table_dis))
+
+Values = as.vector(t(as.matrix(output_table_dis)))
+plot_data = data.frame(Discovery, Methods, Values, Drug)
+plot_data = plot_data[plot_data$Methods %in% c('SAS','KLCD', 'KSCD', 'KLSM'),]
+data_text<-data.frame(label=c("n=767  p=201","n=328  p=147","n=825  p=206","n=515  p=184",
+                              "n=842  p=207","n=793  p=205","n=824  p=206"),
+                      Drug=paste('Resistance to',colnames(Y)),
+                      x=rep(2.5, 7),
+                      y=rep(37, 7))
+
+Fig1 = ggplot(plot_data, aes(x=Methods, y=Values, fill=Discovery)) + 
+  geom_bar(stat="identity",position = "stack", alpha = 0.95, color = 'white') + 
+  geom_text(aes(label=round(Values,2)),position = position_stack(vjust = 0.5),size=2) +
+  ylab('Numbers of the discovered mutations') + 
+  xlab('') + 
+  ylim(c(0,38.5))+
+  scale_fill_manual(values = c("In TSM list"="#a3cd5b",
+                               "Not in TSM list"="#8ea0cc")) +
+  theme_bw() + 
+  facet_wrap(~Drug, ncol=4, scales = "free_x") +
+  geom_text(data=data_text,mapping=aes(x=x,y=y,label=label,fill=NULL),size=3)+
+  theme(axis.text.x = element_text(angle=60, hjust = 1),
+        legend.position = c(0.88,0.2),
+        legend.title = element_blank())
+ggsave('HIV_q02_1.jpg',Fig1, width = 6, height = 5, dpi = 600)
+
+Values = as.vector(t(as.matrix(output_table_dis_der)))
+plot_data = data.frame(Discovery, Methods, Values, Drug)
+plot_data = plot_data[plot_data$Methods %in% c('SAS','KLCD', 'KSCD', 'KLSM'),]
+data_text<-data.frame(label=c("n=767  p=201","n=328  p=147","n=825  p=206","n=515  p=184",
+                              "n=842  p=207","n=793  p=205","n=824  p=206"),
+                      Drug=paste('Resistance to',colnames(Y)),
+                      x=rep(2.5, 7),
+                      y=rep(37, 7))
+
+Fig1_DER = ggplot(plot_data, aes(x=Methods, y=Values, fill=Discovery)) + 
+  geom_bar(stat="identity",position = "stack", alpha = 0.95, color = 'white') + 
+  geom_text(aes(label=round(Values,2)),position = position_stack(vjust = 0.5),size=2) +
+  ylab('Numbers of the discovered mutations') + 
+  xlab('') + 
+  ylim(c(0,42))+
+  scale_fill_manual(values = c("In TSM list"="#a3cd5b",
+                               "Not in TSM list"="#8ea0cc")) +
+  theme_bw() + 
+  facet_wrap(~Drug, ncol=4, scales = "free_x") +
+  geom_text(data=data_text,mapping=aes(x=x,y=y,label=label,fill=NULL),size=3)+
+  theme(axis.text.x = element_text(angle=60, hjust = 1),
+        legend.position = c(0.88,0.2),
+        legend.title = element_blank())
+ggsave('DER_HIV_q02_1.jpg',Fig1_DER, width = 6, height = 5, dpi = 600)
+stopImplicitCluster()
+stopCluster(cl)
+```
+
+```{r, fig.width = 6, fig.height = 5}
+Fig1
+```
+
+```{r, fig.width = 6, fig.height = 5}
+Fig1_DER
+```
+
