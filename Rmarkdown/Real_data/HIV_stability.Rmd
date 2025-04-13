@@ -1,0 +1,276 @@
+---
+title: "HIV Data Analysis (Bar Plot)"
+output: html_document
+date: "2024-03-11"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r, results = 'hide'}
+path = dirname(rstudioapi::getActiveDocumentContext()$path)
+setwd(path)
+library(MASS) 
+library(ggplot2)
+library(patchwork)
+library(glmnet)
+library(knockoff)
+library(doSNOW)
+library(foreach)
+library(doParallel)
+source('Functions.R')
+cl <- makeCluster(25, outfile = 'Realdata_outs.out')
+registerDoParallel(cl)
+registerDoSNOW(cl)
+clusterEvalQ(cl = cl, RhpcBLASctl::blas_set_num_threads(1))
+
+Rep_times = 50
+L = 50
+fdr_target = 0.1
+drug_class = 'PI'
+seeds = 99 
+  
+### Cleaning and Fetching the data
+base_url = 'https://hivdb.stanford.edu/_wrapper/pages/published_analysis/genophenoPNAS2006'
+gene_url = paste(base_url, 'DATA', paste0(drug_class, '_DATA.txt'), sep='/')
+tsm_url = paste(base_url, 'MUTATIONLISTS', 'NP_TSM', drug_class, sep='/')
+gene_df = read.delim(gene_url, na.string = c('NA', ''), stringsAsFactors = FALSE)
+tsm_df = read.delim(tsm_url, header = FALSE, stringsAsFactors = FALSE)
+names(tsm_df) = c('Position', 'Mutations')
+
+### Removing the rows with error flags or nonstandard mutation codes
+pos_start = which(names(gene_df) == 'P1')
+pos_cols = seq.int(pos_start, ncol(gene_df))
+valid_rows = grepl_rows('^(\\.|-|[A-Zid]+)$', gene_df[,pos_cols])
+gene_df = gene_df[valid_rows,]
+
+### Prepare the design matrix and response variable.
+# Flatten a matrix to a vector with names from concatenating row/column names
+# Construct preliminary design matrix.
+muts = c(LETTERS, 'i', 'd')
+X = outer(muts, as.matrix(gene_df[,pos_cols]), Vectorize(grepl))
+X = aperm(X, c(2,3,1))
+dimnames(X)[[3]] <- muts
+X = t(apply(X, 1, flatten_matrix))
+mode(X) <- 'numeric'
+
+# Remove any mutation/position pairs that never appear in the data.
+X = X[,colSums(X) != 0]
+X_ = X
+
+# Extract response matrix.
+Y11 = gene_df[,4:(pos_start-1)]
+Y = gene_df[,4:(pos_start-1)]
+
+plot_list = list()
+for (yy in 1:length(Y11)) {
+  # Experiment
+  y = log(Y11[,yy])
+  missing = is.na(y)
+  y = y[!missing]
+  X = X_[!missing,]
+  X = X[,colSums(X) >= 3]
+  X = X[,colSums(abs(cor(X)-1) < 1e-4) == 1]
+  
+  Adp_list  = list()
+  
+  Output_dis <- foreach (time = 1:Rep_times, .packages =c('MASS', 'knockoff', 'glmnet')) %dopar%  {
+    source('Functions.R')
+    set.seed(time+seeds)
+    print(paste("Rep time:", time))
+    X_matrix = X
+    AdpK_inclusion = Kminus_inclusion = Ksquare_inclusion = Kmax_inclusion = array(0,dim = c(1, ncol(X_matrix)))
+    index = c()
+    ii = 0
+    for (i in colnames(X_matrix)) {
+      ii = ii + 1
+      if(get_position(i) %in% tsm_df$Position){
+        index = c(index, ii)
+      }
+    }
+    n=length(y)
+    Y = as.matrix(y)
+    X_knockoffs = create.second_order(X_matrix,  method='equi')
+    X_matrix = cbind(X_matrix, X_knockoffs)
+    cvfit <- cv.glmnet(X_matrix, Y, intercept = F)
+    lambda <- cvfit$lambda.min
+    beta1 <- as.vector(glmnet(X_matrix, Y, alpha = 1, lambda = lambda, intercept = F)$beta)
+    index_beta1 = which(beta1 == 0)
+    ## Get the debiased Lasso estimator
+    M1 = get_M(X_matrix)
+    beta1_d = as.numeric(beta1 + 1/n*M1%*%t(X_matrix)%*%(Y - X_matrix %*% beta1))
+    ## Get the variance for the debiased Lasso estimator (up to a scaling factor)
+    sigma1 = sqrt(diag(M1%*%(t(X_matrix)%*%diag(diag((Y-X_matrix%*%beta1)%*%t(Y-X_matrix%*%beta1)))%*%X_matrix/(n/1))%*%t(M1)))
+    tmp = beta1_d/sigma1
+    d_X = ncol(X_matrix)/2
+    X1 = tmp[1:(d_X)] - tmp[(d_X+1):(d_X*2)]
+    X2 = tmp[1:(d_X)] + tmp[(d_X+1):(d_X*2)]
+  
+    
+    selected = SAS(X1,X2,c=1,c0=1,c1=1,q_fdr=fdr_target)
+    selected_AdpK = colnames(X)[selected]
+    AdpK = dr(selected_AdpK)
+    AdpK_inclusion[selected] = 1/max(length(selected),1)/Rep_times
+    
+    return(list(selected_AdpK))
+  }
+  
+  for (i in 1:Rep_times) {
+    Adp_list[i] = Output_dis[[i]]
+  }
+  Adp_vec = unlist(Adp_list)
+  never = length(colnames(X)) - length(unique(Adp_vec))
+  tmp = as.vector(table(Adp_vec)/Rep_times)
+  plot_list[[yy]] = c(never + sum(tmp<=0.2),sum(0.2<tmp & tmp<=0.4), sum(0.4<tmp & tmp<=0.6), sum(0.6<tmp & tmp<=0.8), sum(0.8<tmp))
+}
+
+
+
+
+for (yy in 1:length(Y11)) {
+  # Experiment
+  print(Sys.time())
+  y = log(Y11[,yy])
+  missing = is.na(y)
+  y = y[!missing]
+  X = X_[!missing,]
+  X = X[,colSums(X) >= 3]
+  X = X[,colSums(abs(cor(X)-1) < 1e-4) == 1]
+  selection = c()
+  
+  for (rep in 1:Rep_times) {
+    print(rep)
+    AdpK_inclusion0 = array(0,dim = c(1, ncol(X)))
+    Output_dis <- foreach (time = 1:L, .packages =c('MASS', 'knockoff', 'glmnet')) %dopar%  {
+      source('Functions.R')
+      set.seed(time+(rep-1)*L)
+      print(paste("Rep time:", time))
+      X_matrix = X
+      AdpK_inclusion = array(0,dim = c(1, ncol(X_matrix)))
+      index = c()
+      ii = 0
+      for (i in colnames(X_matrix)) {
+        ii = ii + 1
+        if(get_position(i) %in% tsm_df$Position){
+          index = c(index, ii)
+        }
+      }
+      n=length(y)
+      Y = as.matrix(y)
+      X_knockoffs = create.second_order(X_matrix,  method='equi')
+      X_matrix = cbind(X_matrix, X_knockoffs)
+      cvfit <- cv.glmnet(X_matrix, Y, intercept = F)
+      lambda <- cvfit$lambda.min
+      beta1 <- as.vector(glmnet(X_matrix, Y, alpha = 1, lambda = lambda, intercept = F)$beta)
+      index_beta1 = which(beta1 == 0)
+      ## Get the debiased Lasso estimator
+      M1 = get_M(X_matrix)
+      beta1_d = as.numeric(beta1 + 1/n*M1%*%t(X_matrix)%*%(Y - X_matrix %*% beta1))
+      ## Get the variance for the debiased Lasso estimator (up to a scaling factor)
+      sigma1 = sqrt(diag(M1%*%(t(X_matrix)%*%diag(diag((Y-X_matrix%*%beta1)%*%t(Y-X_matrix%*%beta1)))%*%X_matrix/(n/1))%*%t(M1)))
+      tmp = beta1_d/sigma1
+      d_X = ncol(X_matrix)/2
+      X1 = tmp[1:(d_X)] - tmp[(d_X+1):(d_X*2)]
+      X2 = tmp[1:(d_X)] + tmp[(d_X+1):(d_X*2)]
+  
+  
+      selected = SAS(X1,X2,c=1,c0=1,c1=1,q_fdr=fdr_target)
+      selected_AdpK = colnames(X)[selected]
+      AdpK_inclusion[selected] = 1/max(length(selected),1)/L
+  
+      return(list(AdpK_inclusion))
+    }
+
+    for (i in 1:L) {
+      AdpK_inclusion0 = AdpK_inclusion0 + Output_dis[[i]][[1]]
+    }
+    selection = c(selection, MSAS_HIV_stability(AdpK_inclusion0, colnames(X), fdr_target))
+  }
+  never = length(colnames(X)) - length(unique(selection))
+  tmp = as.vector(table(selection)/Rep_times)
+  plot_list[[yy+7]] = c(never + sum(tmp<=0.2),sum(0.2<tmp & tmp<=0.4), sum(0.4<tmp & tmp<=0.6), sum(0.6<tmp & tmp<=0.8), sum(0.8<tmp))
+}
+
+stopImplicitCluster()
+stopCluster(cl)
+
+
+
+# Define titles
+titles <- c("Resistance to APV", "Resistance to ATV", "Resistance to IDV", 
+            "Resistance to LPV", "Resistance to NFV", "Resistance to RTV", 
+            "Resistance to SQV")
+
+# Create a list to store plots
+plots <- list()
+
+# Loop to generate each plot
+for (j in 1:7) {
+  # Get data for the jth category and the j+7th category
+  counts_class1 <- plot_list[[j]]
+  counts_class2 <- plot_list[[j + 7]]
+  
+  # Compute total sample size for calculating frequencies
+  total_class1 <- sum(counts_class1)
+  total_class2 <- sum(counts_class2)
+  
+  # Convert counts to frequencies
+  freq_class1 <- counts_class1 / total_class1
+  freq_class2 <- counts_class2 / total_class2
+  
+  # Define interval labels
+  bins <- c("[0, 0.2]", "(0.2, 0.4]", "(0.4, 0.6]", "(0.6, 0.8]", "(0.8, 1.0]")
+  
+  # Create a data frame
+  data <- data.frame(
+    Interval = factor(rep(bins, 2), levels = bins),  # Define interval as factor
+    Frequency = c(-freq_class1, freq_class2),       # One class to the left (negative), the other to the right
+    Method = factor(rep(c("SAS", "Derandomized SAS"), each = 5), 
+                    levels = c("SAS", "Derandomized SAS"))  # Set factor levels
+  )
+  
+  # Use ggplot2 to create a tornado plot
+  p <- ggplot(data, aes(x = Frequency, y = Interval, fill = Method)) +
+    geom_bar(stat = "identity", position = "identity", width = 0.7) +
+    theme_bw() +  # Use theme_bw for a clean style
+    scale_x_continuous(
+      breaks = seq(-1, 1, by = 0.25),  # Set x-axis ticks every 0.1
+      labels = abs(seq(-1, 1, by = 0.25))  # Display frequencies as absolute values
+    ) +
+    scale_fill_manual(values = c("gray70", "gray50")) +  # Use muted colors
+    labs(
+      x = "Proportion",    # Show x-axis label for each plot
+      y = if (j %% 4 == 1) "Interval" else NULL  # Show y-axis label only for the first column
+    ) +
+    theme(
+      legend.position = "none",                # No legend for individual plots
+      legend.title = element_blank(),          # Remove legend title
+      axis.text.y = if (j %% 4 == 1) element_text(size = 8) else element_blank(), # Show y-axis text only for the first column
+      axis.ticks.y = if (j %% 4 == 1) element_line() else element_blank(), # Remove y-axis ticks for columns 2, 3, 4
+      axis.title.y = if (j %% 4 == 1) element_text(size = 8) else element_blank(), # Show y-axis label only for the first column
+      axis.text.x = element_text(size = 6),    # Smaller font size for x-axis ticks
+      axis.title.x = element_text(size = 8),  # Smaller font size for x-axis label
+      plot.title = element_text(size = 9, hjust = 0.5), # Center the title with smaller font size
+      strip.text = element_text(size = 8, color = "black"),  # Use normal font for titles
+      strip.background = element_rect(fill = "gray80", color = "black")  # Set a gray background for titles
+    ) +
+    labs(title = titles[j])  # Show titles in gray box
+  
+  # Store the plot
+  plots[[j]] <- p
+}
+
+# Use patchwork to combine plots, ensuring 4 plots per row and a centralized legend
+final_plot <- (plots[[1]] | plots[[2]] | plots[[3]] | plots[[4]]) /
+  (plots[[5]] | plots[[6]] | plots[[7]] | plot_spacer()) +
+  plot_layout(guides = "collect") & theme(legend.position = "bottom")
+
+# Output the final plot
+print(final_plot)
+
+# Save the final plot as a high-resolution image
+ggsave('HIV_stability.jpg', final_plot, width = 7, height = 5, dpi = 600)
+
+```

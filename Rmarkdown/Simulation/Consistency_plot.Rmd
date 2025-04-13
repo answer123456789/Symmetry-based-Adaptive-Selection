@@ -1,0 +1,168 @@
+---
+title: "Consistency Plot"
+output: html_document
+date: "2024-03-15"
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+```
+
+```{r, results='hide'}
+path = dirname(rstudioapi::getActiveDocumentContext()$path)
+setwd(path)
+
+library(MASS)
+library(ggplot2)
+library(ggthemes)
+library(patchwork)
+library(latex2exp)
+set.seed(41) 
+sd1 = 0.5
+n_vec = c(100,200,400)
+p_vec = c(100,600,2000)
+plot_list = list()
+for (ii in 1:length(p_vec)) {
+  plot_list_tmp = list()
+  for (jj in 1:length(n_vec)) {
+    d_X = p_vec[ii]
+    n = n_vec[jj]/2
+    d_h1 = 50
+    d_h0= d_X-d_h1
+    positive = 0.2
+    posi_len = round(positive*d_h1)
+    nega_len = d_h1 - posi_len
+    c1 = rep(0.25,round(posi_len))
+    c2 = rep(-0.25,round(nega_len))
+    coef_X = matrix(c(rep(0,d_h0), c1, c2), d_X) 
+    coef = sample(coef_X)
+    Sigma = diag(1,d_X,d_X)
+    for (i in 1:d_X) {
+      for (j in 1:d_X) {
+        Sigma[i,j] = 0.5^abs(i-j)
+      }
+    }
+    Sigma_inv = solve(Sigma)
+    Cov = Sigma_inv/n
+    X11 = mvrnorm(1,coef, Cov)
+    X22 = mvrnorm(1,coef, Cov)
+    X1 = as.vector(X11/sqrt(diag(Cov)))*sd1
+    X2 = as.vector(X22/sqrt(diag(Cov)))*sd1
+    
+    index1 = intersect(which(X1>0),which(X2>0))
+    index2 = intersect(which(X1<0),which(X2>0))
+    index3 = intersect(which(X1<0),which(X2<0))
+    index4 = intersect(which(X1>0),which(X2<0))
+    
+    X1_4444 = c(X1[c(index2,index4)])
+    X2_4444 = c(X2[c(index2,index4)])
+    
+    h0 =  1*c(bandwidth.nrd(X1_4444), bandwidth.nrd(X2_4444)) #seed1234 0.9good
+    h000 =  1*c(bandwidth.nrd(X1), bandwidth.nrd(X2))
+    
+    Kernel_h0 = function(x){sum(dnorm((x[1] - X1_4444)/h0[1])*dnorm((x[2] - X2_4444)/h0[2]))/(h0[1]*h0[2]*length(X1_4444))}
+    f0_hat0 = function(x){
+      return(0.5*(0.5*(Kernel_h0(x) + Kernel_h0(c(-x[1],x[2]))) + 0.5*(Kernel_h0(c(x[1],-x[2])) + Kernel_h0(-x))))
+    }
+    f0_hat = function(x){
+      return(0.5*(f0_hat0(x) + f0_hat0(c(x[2],x[1]))))
+    }
+
+    
+    x_range <- seq(-3, 3, length.out = 80) 
+    y_range <- seq(-3, 3, length.out = 80)
+    grid <- expand.grid(x = x_range, y = y_range)
+    f_hat_values <- apply(grid, 1, f0_hat)
+    
+    data1 = data.frame(grid,f_hat_values)
+    plot_list_tmp[[jj]] = data1
+  }
+  plot_list[ii][[1]] = plot_list_tmp
+}
+
+
+latex_expression <- TeX("$N(0_2,0.25I_2)$")
+n_hat = function(x){return(dnorm(x[1],sd=sd1)*dnorm(x[2],sd=sd1))}
+n_hat_values <- apply(grid, 1, n_hat)
+data = data.frame(grid,n_hat_values)
+p1 = ggplot(data, aes(x=x,y=y,z=n_hat_values)) +
+  stat_contour(geom="polygon",aes(fill=stat(level)),bins=150)+
+  geom_contour(color='white',alpha=0.25,linewidth=0.7)+
+  scale_fill_gradient(limits=c(0,dnorm(0,sd=sd1)^2))+
+  annotate("text", x = -1 , y = 2.5,label = latex_expression, colour="white") +
+  ylab(expression(italic(t^(2))))+
+  xlab(expression(italic(t^(1))))+
+  theme(panel.background=element_rect(fill="#132B43"),
+        panel.grid=element_blank(),
+  )+
+  xlim(c(-3,3)) +
+  ylim(c(-3,3)) 
+p = ggplot(data, aes(x=x,y=y,z=n_hat_values)) +
+  stat_contour(geom="polygon",aes(fill=stat(level)),bins=150)+
+  geom_contour(color='white',alpha=0.25,linewidth=0.7)+
+  scale_fill_gradient(limits=c(0,dnorm(0,sd=sd1)^2))+
+  annotate("text", x = -1 , y = 2.5,label = latex_expression, colour="white") +
+  ylab(NULL)+
+  xlab(expression(italic(t^(1))))+
+  theme(panel.background=element_rect(fill="#132B43"),
+        panel.grid=element_blank(),
+  )+
+  xlim(c(-3,3)) +
+  ylim(c(-3,3)) 
+
+for (ii in 1:length(p_vec)) {
+  for (jj in 1:length(n_vec)) {
+    text = paste('n=',n_vec[jj],'; p=',p_vec[ii],sep='')
+    if (ii*jj == 1){
+      Fig = ggplot(plot_list[ii][[1]][[jj]], aes(x=x,y=y,z=f_hat_values)) + 
+        stat_contour(geom="polygon",aes(fill=stat(level)),bins=150)+
+        geom_contour(color='white',alpha=0.25,linewidth=0.7)+
+        scale_fill_gradient(limits=c(0,dnorm(0,sd=sd1)^2))+
+        annotate("text", x = -1 , y = 2.5,label = text, colour="white") +
+        xlab(NULL)+
+        ylab(expression(italic(t^(2))))+
+        theme(panel.background=element_rect(fill="#132B43"),
+              panel.grid=element_blank(),
+        )+
+        xlim(c(-3,3)) +
+        ylim(c(-3,3)) 
+    }else if(jj == 1){
+      Fig = Fig + ggplot(plot_list[ii][[1]][[jj]], aes(x=x,y=y,z=f_hat_values)) + 
+        stat_contour(geom="polygon",aes(fill=stat(level)),bins=150)+
+        geom_contour(color='white',alpha=0.25,linewidth=0.7)+
+        scale_fill_gradient(limits=c(0,dnorm(0,sd=sd1)^2))+
+        annotate("text", x = -1 , y = 2.5,label = text, colour="white") +
+        xlab(NULL)+
+        ylab(expression(italic(t^(2))))+
+        theme(panel.background=element_rect(fill="#132B43"),
+              panel.grid=element_blank(),
+        )+
+        xlim(c(-3,3)) +
+        ylim(c(-3,3))       
+    }else{
+      Fig = Fig + ggplot(plot_list[ii][[1]][[jj]], aes(x=x,y=y,z=f_hat_values)) + 
+        stat_contour(geom="polygon",aes(fill=stat(level)),bins=150)+
+        geom_contour(color='white',alpha=0.25,linewidth=0.7)+
+        scale_fill_gradient(limits=c(0,dnorm(0,sd=sd1)^2))+
+        annotate("text", x = -1 , y = 2.5,label = text, colour="white") +
+        ylab(NULL)+
+        xlab(NULL)+
+        theme(panel.background=element_rect(fill="#132B43"),
+              panel.grid=element_blank(),
+              legend.position = 'none'
+        )+
+        xlim(c(-3,3)) +
+        ylim(c(-3,3)) 
+    }
+  }
+}
+
+Fig = Fig + p1 + p + p + plot_layout(ncol = length(n_vec), byrow=T, guides = 'collect') 
+ggsave('Consistency.jpg',Fig, width = 8, height = 9.3, dpi =400)
+```
+
+```{r, fig.width = 8, fig.height =9.3}
+Fig
+```
